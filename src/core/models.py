@@ -6,7 +6,8 @@ EDU-Audit Core Models
 from datetime import datetime
 from enum import Enum
 from typing import List, Optional, Dict, Any, Union
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator, ValidationInfo
+import json
 
 class IssueType(str, Enum):
     """발견 가능한 이슈 요형"""
@@ -27,8 +28,8 @@ class TextLocation(BaseModel):
     end: int = Field(..., ge=0, description="종료 위치")
 
     @field_validator('end')
-    def end_after_start(cls, v, values):
-        if 'start' in values and v <= values['start']:
+    def end_after_start(cls, v, info: ValidationInfo):
+        if (start := info.data.get('start')) is not None and v <= start:
             raise ValueError('end must be greater than start')
         return v
 
@@ -69,11 +70,11 @@ class Issue(BaseModel):
     detected_at: datetime = Field(default_factory=datetime.now)
     agent_name: str = Field(..., description="검출한 에이전트명")
     
-    @validator('confidence_level', always=True)
-    def set_confidence_level(cls, v, values):
-        if 'confidence' not in values:
+    @field_validator('confidence_level', mode='before')
+    def set_confidence_level(cls, v, info: ValidationInfo):
+        confidence = info.data.get('confidence')
+        if confidence is None:
             return v
-        confidence = values['confidence']
         if confidence >= 0.9:
             return ConfidenceLevel.HIGH
         elif confidence >= 0.7:
@@ -96,11 +97,11 @@ class AuditReport(BaseModel):
     
     agents_used: List[str] = Field(default_factory=list, description="사용된 에이전트")
     
-    @field_validator('total_issues', always=True)
-    def set_total_issues(cls, v, values):
-        if 'issues' in values:
-            return len(values['issues'])
-        return v
+    # 모델 전체 검증 후 total_issues 자동 계산
+    @model_validator(mode="after")
+    def set_total_issues(self) -> "AuditReport":
+        self.total_issues = len(self.issues)
+        return self
 
 
 # MCP 도구 입출력 모델
@@ -205,13 +206,12 @@ if __name__ == "__main__":
     print(f"✅ Report 생성: {report.report_id}")
     print(f"   총 이슈 수: {report.total_issues}")
     
-    # 3. JSON 직렬화 테스트
-    import json
-    report_json = report.json(indent=2, ensure_ascii=False)
+    # 3. JSON 직렬화
+    report_json = report.model_dump_json(indent=2)
     print("✅ JSON 직렬화 성공")
-    
-    # 4. 역직렬화 테스트
-    restored_report = AuditReport.parse_raw(report_json)
+
+    # 4. 역직렬화
+    restored_report = AuditReport.model_validate_json(report_json)
     print(f"✅ JSON 역직렬화 성공: {restored_report.report_id}")
     
     print("🎉 모든 모델 테스트 통과!")
