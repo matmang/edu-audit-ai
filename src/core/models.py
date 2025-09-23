@@ -18,8 +18,9 @@ class IssueType(str, Enum):
     GRAMMAR = "grammar"
     # 멀티모달 이슈 타입 추가
     IMAGE_QUALITY = "image_quality"
-    TABLE_FORMAT = "table_format"
-    CHART_READABILITY = "chart_readability"
+    CONTENT_CLARITY = "content_clarity"
+    LAYOUT = "layout"
+
 
 class ConfidenceLevel(str, Enum):
     """신뢰도 수준"""

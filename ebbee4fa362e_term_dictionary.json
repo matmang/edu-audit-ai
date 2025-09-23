@@ -1,0 +1,492 @@
+{
+  "symbols": {
+    "x": [
+      {
+        "term": "x",
+        "slide_id": "p004",
+        "context": "Input (features)",
+        "definition_type": "usage"
+      },
+      {
+        "term": "x",
+        "slide_id": "p007",
+        "context": "Input: x",
+        "definition_type": "usage"
+      },
+      {
+        "term": "x",
+        "slide_id": "p008",
+        "context": "Training data D = {(x(1),",
+        "definition_type": "usage"
+      }
+    ],
+    "ŷ": [
+      {
+        "term": "ŷ",
+        "slide_id": "p004",
+        "context": "Output (prediction)",
+        "definition_type": "usage"
+      },
+      {
+        "term": "ŷ",
+        "slide_id": "p007",
+        "context": "Output: ŷ = wᵀx + b",
+        "definition_type": "usage"
+      }
+    ],
+    "y": [
+      {
+        "term": "y",
+        "slide_id": "p004",
+        "context": "Label (Actual)",
+        "definition_type": "usage"
+      },
+      {
+        "term": "y",
+        "slide_id": "p007",
+        "context": "y ≈ ŷ",
+        "definition_type": "usage"
+      },
+      {
+        "term": "y",
+        "slide_id": "p008",
+        "context": "Training data D = {(x(1), y(1))",
+        "definition_type": "usage"
+      }
+    ],
+    "D": [
+      {
+        "term": "D",
+        "slide_id": "p004",
+        "context": "D = {(x^(1), y^(1)),...",
+        "definition_type": "usage"
+      }
+    ],
+    "w": [
+      {
+        "term": "w",
+        "slide_id": "p007",
+        "context": "Parameters: w ∈ ℝᵈ",
+        "definition_type": "usage"
+      },
+      {
+        "term": "w",
+        "slide_id": "p008",
+        "context": "J(w, b) minimizes",
+        "definition_type": "implicit"
+      },
+      {
+        "term": "w",
+        "slide_id": "p010",
+        "context": "parameters w ∈ 𝑅ⁿ",
+        "definition_type": "usage"
+      }
+    ],
+    "b": [
+      {
+        "term": "b",
+        "slide_id": "p007",
+        "context": "Parameters: b ∈ ℝ",
+        "definition_type": "usage"
+      },
+      {
+        "term": "b",
+        "slide_id": "p008",
+        "context": "J(w, b) minimizes",
+        "definition_type": "implicit"
+      },
+      {
+        "term": "b",
+        "slide_id": "p010",
+        "context": "b ∈ 𝑅 that minimize",
+        "definition_type": "usage"
+      }
+    ],
+    "L": [
+      {
+        "term": "L",
+        "slide_id": "p007",
+        "context": "Loss function L(ŷ, y) = (y - ŷ)²",
+        "definition_type": "explicit"
+      },
+      {
+        "term": "L",
+        "slide_id": "p010",
+        "context": "Loss function L(ŷ, y)",
+        "definition_type": "explicit"
+      }
+    ],
+    "J": [
+      {
+        "term": "J",
+        "slide_id": "p007",
+        "context": "Cost function J(w, b)",
+        "definition_type": "explicit"
+      },
+      {
+        "term": "J",
+        "slide_id": "p008",
+        "context": "J(w, b) = 1/m Σ",
+        "definition_type": "explicit"
+      },
+      {
+        "term": "J",
+        "slide_id": "p010",
+        "context": "J(w, b) = 1/m Σ",
+        "definition_type": "implicit"
+      },
+      {
+        "term": "J",
+        "slide_id": "p011",
+        "context": "cost function J(θ)",
+        "definition_type": "explicit"
+      }
+    ],
+    "Σ": [
+      {
+        "term": "Σ",
+        "slide_id": "p008",
+        "context": "J(w, b) = 1/m Σ",
+        "definition_type": "explicit"
+      }
+    ],
+    "∑": [
+      {
+        "term": "∑",
+        "slide_id": "p010",
+        "context": "Σ (y⁽ⁱ⁾ − ŷ⁽ⁱ⁾)²",
+        "definition_type": "usage"
+      },
+      {
+        "term": "∑",
+        "slide_id": "p014",
+        "context": "Summation in derivative formula",
+        "definition_type": "usage"
+      }
+    ],
+    "θ": [
+      {
+        "term": "θ",
+        "slide_id": "p011",
+        "context": "model parameters",
+        "definition_type": "explicit"
+      },
+      {
+        "term": "θ",
+        "slide_id": "p013",
+        "context": "Gradient descent θ = θ - η ∇θJ(θ)",
+        "definition_type": "usage"
+      },
+      {
+        "term": "θ",
+        "slide_id": "p014",
+        "context": "Gradient descent θ = θ - η ∇θJ(θ)",
+        "definition_type": "usage"
+      }
+    ],
+    "η": [
+      {
+        "term": "η",
+        "slide_id": "p011",
+        "context": "Learning rate η",
+        "definition_type": "explicit"
+      },
+      {
+        "term": "η",
+        "slide_id": "p014",
+        "context": "Learning rate η in gradient descent",
+        "definition_type": "usage"
+      }
+    ],
+    "∇": [
+      {
+        "term": "∇",
+        "slide_id": "p011",
+        "context": "∇θJ(θ)",
+        "definition_type": "usage"
+      },
+      {
+        "term": "∇",
+        "slide_id": "p014",
+        "context": "∇θJ(θ) in gradient formula",
+        "definition_type": "usage"
+      }
+    ],
+    "∂": [
+      {
+        "term": "∂",
+        "slide_id": "p012",
+        "context": "손실 함수의 편미분을 통해",
+        "definition_type": "usage"
+      }
+    ]
+  },
+  "terms": {
+    "Supervised learning": [
+      {
+        "term": "Supervised learning",
+        "slide_id": "p002",
+        "context": "Topics - Supervised learning",
+        "definition_type": "explicit"
+      }
+    ],
+    "Linear regression": [
+      {
+        "term": "Linear regression",
+        "slide_id": "p002",
+        "context": "Topics - Linear regression",
+        "definition_type": "explicit"
+      },
+      {
+        "term": "Linear regression",
+        "slide_id": "p008",
+        "context": "linear regression model",
+        "definition_type": "usage"
+      }
+    ],
+    "Model": [
+      {
+        "term": "Model",
+        "slide_id": "p002",
+        "context": "Linear regression - Model",
+        "definition_type": "usage"
+      },
+      {
+        "term": "Model",
+        "slide_id": "p004",
+        "context": "Building a model to...",
+        "definition_type": "implicit"
+      },
+      {
+        "term": "Model",
+        "slide_id": "p007",
+        "context": "Training a linear regression model",
+        "definition_type": "implicit"
+      }
+    ],
+    "Cost/Loss function": [
+      {
+        "term": "Cost/Loss function",
+        "slide_id": "p002",
+        "context": "Linear regression - Cost/Loss",
+        "definition_type": "usage"
+      }
+    ],
+    "Optimization": [
+      {
+        "term": "Optimization",
+        "slide_id": "p002",
+        "context": "Linear regression - Optimization",
+        "definition_type": "usage"
+      },
+      {
+        "term": "Optimization",
+        "slide_id": "p010",
+        "context": "Linear regression model",
+        "definition_type": "explicit"
+      },
+      {
+        "term": "Optimization",
+        "slide_id": "p011",
+        "context": "minimize a cost function",
+        "definition_type": "implicit"
+      },
+      {
+        "term": "Optimization",
+        "slide_id": "p012",
+        "context": "모델을 최적화하는 방법",
+        "definition_type": "usage"
+      }
+    ],
+    "Supervised Learning": [
+      {
+        "term": "Supervised Learning",
+        "slide_id": "p003",
+        "context": "입력 데이터와 정답 레이블 사용",
+        "definition_type": "explicit"
+      },
+      {
+        "term": "Supervised Learning",
+        "slide_id": "p004",
+        "context": "Goal: generalize the...",
+        "definition_type": "explicit"
+      }
+    ],
+    "Training": [
+      {
+        "term": "Training",
+        "slide_id": "p004",
+        "context": "Building a model to...",
+        "definition_type": "explicit"
+      }
+    ],
+    "Features": [
+      {
+        "term": "Features",
+        "slide_id": "p004",
+        "context": "Input (features)",
+        "definition_type": "usage"
+      },
+      {
+        "term": "Features",
+        "slide_id": "p006",
+        "context": "...and one or more explanatory variables (features)",
+        "definition_type": "implicit"
+      }
+    ],
+    "Labels": [
+      {
+        "term": "Labels",
+        "slide_id": "p004",
+        "context": "Label (Actual)",
+        "definition_type": "usage"
+      }
+    ],
+    "Classification": [
+      {
+        "term": "Classification",
+        "slide_id": "p005",
+        "context": "데이터를 범주로 나누는 작업",
+        "definition_type": "explicit"
+      }
+    ],
+    "Regression": [
+      {
+        "term": "Regression",
+        "slide_id": "p005",
+        "context": "숫자 값을 예측하는 작업",
+        "definition_type": "explicit"
+      },
+      {
+        "term": "Regression",
+        "slide_id": "p006",
+        "context": "An example of regression algorithm",
+        "definition_type": "explicit"
+      },
+      {
+        "term": "Regression",
+        "slide_id": "p007",
+        "context": "Linear Regression",
+        "definition_type": "explicit"
+      }
+    ],
+    "Linear Regression": [
+      {
+        "term": "Linear Regression",
+        "slide_id": "p006",
+        "context": "Modelling the linear relationship...",
+        "definition_type": "explicit"
+      },
+      {
+        "term": "Linear Regression",
+        "slide_id": "p009",
+        "context": "경사하강법을 이용한 선형 회귀",
+        "definition_type": "explicit"
+      }
+    ],
+    "Label": [
+      {
+        "term": "Label",
+        "slide_id": "p006",
+        "context": "...between a scalar response (label) and...",
+        "definition_type": "implicit"
+      }
+    ],
+    "Loss Function": [
+      {
+        "term": "Loss Function",
+        "slide_id": "p007",
+        "context": "Loss function L(ŷ, y)",
+        "definition_type": "explicit"
+      },
+      {
+        "term": "Loss Function",
+        "slide_id": "p010",
+        "context": "Loss function L(ŷ, y)",
+        "definition_type": "explicit"
+      },
+      {
+        "term": "Loss Function",
+        "slide_id": "p012",
+        "context": "손실 함수 L(ŷ, y) = (y - ŷ)^2",
+        "definition_type": "explicit"
+      },
+      {
+        "term": "Loss Function",
+        "slide_id": "p014",
+        "context": "Gradient involves J(w, b)",
+        "definition_type": "implicit"
+      }
+    ],
+    "Gradient": [
+      {
+        "term": "Gradient",
+        "slide_id": "p007",
+        "context": "implied optimization context",
+        "definition_type": "implicit"
+      },
+      {
+        "term": "Gradient",
+        "slide_id": "p012",
+        "context": "경사 하강법을 통해",
+        "definition_type": "explicit"
+      },
+      {
+        "term": "Gradient",
+        "slide_id": "p014",
+        "context": "Gradient used in parameter update",
+        "definition_type": "implicit"
+      }
+    ],
+    "Gradient descent": [
+      {
+        "term": "Gradient descent",
+        "slide_id": "p008",
+        "context": "We are going to use gradient",
+        "definition_type": "explicit"
+      },
+      {
+        "term": "Gradient descent",
+        "slide_id": "p014",
+        "context": "Title and formula for training",
+        "definition_type": "explicit"
+      }
+    ],
+    "Gradient Descent": [
+      {
+        "term": "Gradient Descent",
+        "slide_id": "p009",
+        "context": "경사하강법을 통해 매개변수",
+        "definition_type": "explicit"
+      },
+      {
+        "term": "Gradient Descent",
+        "slide_id": "p010",
+        "context": "Gradient Descent!",
+        "definition_type": "usage"
+      },
+      {
+        "term": "Gradient Descent",
+        "slide_id": "p011",
+        "context": "A popular optimization algorithm",
+        "definition_type": "explicit"
+      }
+    ],
+    "Cost Function": [
+      {
+        "term": "Cost Function",
+        "slide_id": "p011",
+        "context": "J(θ): cost function",
+        "definition_type": "explicit"
+      }
+    ],
+    "w, b": [
+      {
+        "term": "w, b",
+        "slide_id": "p014",
+        "context": "Initialize weights w and b",
+        "definition_type": "usage"
+      }
+    ]
+  }
+}

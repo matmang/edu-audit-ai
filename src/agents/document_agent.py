@@ -1,42 +1,36 @@
 """
-EDU-Audit Multimodal Document Agent
-PDF/PPT 멀티모달 파싱 및 LlamaIndex 연동 - 하이브리드 접근
+ DocumentAgent with Term/Symbol Dictionary
+용어 및 심볼 딕셔너리 기능이 추가된 DocumentAgent
 """
 
 import asyncio
 import logging
 import os
 import base64
+import json
+import re
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Set
 from io import BytesIO
+from collections import defaultdict
 
 # PDF/PPT 파싱 라이브러리
-import pdfplumber
+import fitz  # PyMuPDF
 from pptx import Presentation
 from PIL import Image
-import fitz  # PyMuPDF for image extraction
 
-# OCR 라이브러리
-try:
-    import easyocr
-    OCR_AVAILABLE = True
-except ImportError:
-    OCR_AVAILABLE = False
-    logging.warning("EasyOCR not available. Install with: pip install easyocr")
+# OpenAI API
+import openai
+from openai import AsyncOpenAI
 
 # LlamaIndex 관련
 from llama_index.core import Document, VectorStoreIndex
-from llama_index.core.node_parser import SentenceSplitter
 from llama_index.embeddings.openai import OpenAIEmbedding
-from llama_index.llms.openai import OpenAI
+from llama_index.llms.openai import OpenAI as LlamaOpenAI
 
-# 확장된 모델들
-from src.core.models import (
-    DocumentMeta, PageInfo, PageElement, ElementType,
-    ImageElement, TableElement, ChartElement, BoundingBox,
-    generate_doc_id, generate_element_id
-)
+# 기본 모델들만 사용
+from src.core.models import DocumentMeta, generate_doc_id
+
 from dotenv import load_dotenv
 
 env_path = Path(__file__).resolve().parents[2] / '.env.dev'
@@ -44,922 +38,817 @@ load_dotenv(env_path)
 
 logger = logging.getLogger(__name__)
 
-class MultimodalDocumentAgent:
-    """멀티모달 문서 파싱 및 LlamaIndex 관리 에이전트"""
+class TermDefinition:
+    """용어 정의 클래스"""
+    def __init__(self, term: str, slide_id: str, context: str, definition_type: str = "explicit"):
+        self.term = term
+        self.slide_id = slide_id
+        self.context = context
+        self.definition_type = definition_type  # explicit, implicit, usage
+        
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "term": self.term,
+            "slide_id": self.slide_id,
+            "context": self.context,
+            "definition_type": self.definition_type
+        }
+
+class TermDictionary:
+    """용어/심볼 딕셔너리 클래스"""
+    def __init__(self):
+        self.symbols: Dict[str, List[TermDefinition]] = defaultdict(list)
+        self.terms: Dict[str, List[TermDefinition]] = defaultdict(list)
+        
+    def add_symbol(self, symbol: str, slide_id: str, context: str, definition_type: str = "usage"):
+        """심볼 추가"""
+        definition = TermDefinition(symbol, slide_id, context, definition_type)
+        self.symbols[symbol].append(definition)
+        
+    def add_term(self, term: str, slide_id: str, context: str, definition_type: str = "usage"):
+        """용어 추가"""
+        definition = TermDefinition(term, slide_id, context, definition_type)
+        self.terms[term].append(definition)
+    
+    def get_symbol_history(self, symbol: str) -> List[TermDefinition]:
+        """심볼의 전체 등장 이력"""
+        return self.symbols.get(symbol, [])
+    
+    def get_term_history(self, term: str) -> List[TermDefinition]:
+        """용어의 전체 등장 이력"""
+        return self.terms.get(term, [])
+    
+    def get_last_definition(self, term_or_symbol: str) -> Optional[TermDefinition]:
+        """가장 최근 정의 가져오기"""
+        # 심볼에서 먼저 찾기
+        if term_or_symbol in self.symbols:
+            definitions = [d for d in self.symbols[term_or_symbol] if d.definition_type == "explicit"]
+            if definitions:
+                return definitions[-1]
+        
+        # 용어에서 찾기
+        if term_or_symbol in self.terms:
+            definitions = [d for d in self.terms[term_or_symbol] if d.definition_type == "explicit"]
+            if definitions:
+                return definitions[-1]
+        
+        return None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """딕셔너리를 JSON 직렬화 가능한 형태로 변환"""
+        return {
+            "symbols": {k: [d.to_dict() for d in v] for k, v in self.symbols.items()},
+            "terms": {k: [d.to_dict() for d in v] for k, v in self.terms.items()}
+        }
+    
+    def get_context_for_slide(self, slide_id: str, terms_symbols: Set[str]) -> Dict[str, Any]:
+        """특정 슬라이드의 용어/심볼에 대한 컨텍스트 정보 반환"""
+        context = {}
+        
+        for item in terms_symbols:
+            # 심볼 검색
+            if item in self.symbols:
+                relevant_defs = []
+                for definition in self.symbols[item]:
+                    if definition.slide_id != slide_id:  # 현재 슬라이드 제외
+                        relevant_defs.append({
+                            "slide_id": definition.slide_id,
+                            "context": definition.context,
+                            "type": definition.definition_type
+                        })
+                if relevant_defs:
+                    context[item] = {
+                        "type": "symbol",
+                        "definitions": relevant_defs
+                    }
+            
+            # 용어 검색
+            if item in self.terms:
+                relevant_defs = []
+                for definition in self.terms[item]:
+                    if definition.slide_id != slide_id:  # 현재 슬라이드 제외
+                        relevant_defs.append({
+                            "slide_id": definition.slide_id,
+                            "context": definition.context,
+                            "type": definition.definition_type
+                        })
+                if relevant_defs:
+                    context[item] = {
+                        "type": "term",
+                        "definitions": relevant_defs
+                    }
+        
+        return context
+
+class DocumentAgent:
+    """
+    용어/심볼 딕셔너리 기능이 추가된 DocumentAgent
+    """
     
     def __init__(
         self, 
         openai_api_key: Optional[str] = None,
-        vision_model: str = "gpt-4-vision-preview",
-        chunk_size: int = 512,
-        chunk_overlap: int = 50,
-        enable_ocr: bool = True,
-        enable_vision_analysis: bool = True
+        vision_model: str = "gpt-5-nano",
+        embedding_model: str = "text-embedding-3-small",
+        image_quality: str = "high"
     ):
-        self.openai_api_key = openai_api_key
+        self.openai_api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
+        if not self.openai_api_key:
+            raise ValueError("OpenAI API Key가 필요합니다.")
+        
         self.vision_model = vision_model
-        self.enable_ocr = enable_ocr and OCR_AVAILABLE
-        self.enable_vision_analysis = enable_vision_analysis and openai_api_key
+        self.embedding_model = embedding_model
+        self.image_quality = image_quality
+        
+        # OpenAI 클라이언트
+        self.client = AsyncOpenAI(api_key=self.openai_api_key)
         
         # LlamaIndex 컴포넌트
-        self.embeddings = OpenAIEmbedding(api_key=openai_api_key)
-        self.text_splitter = SentenceSplitter(
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap
+        self.embeddings = OpenAIEmbedding(
+            model=embedding_model,
+            api_key=self.openai_api_key
         )
         
-        # Vision LLM (이미지 분석용)
-        self.vision_llm = None
-        if self.enable_vision_analysis:
-            self.vision_llm = OpenAI(
-                model=vision_model,
-                api_key=openai_api_key,
-                temperature=0.1
-            )
-        
-        # OCR 초기화
-        self.ocr_reader = None
-        if self.enable_ocr:
-            try:
-                self.ocr_reader = easyocr.Reader(['ko', 'en'])
-                logger.info("EasyOCR 초기화 완료 (한국어, 영어)")
-            except Exception as e:
-                logger.warning(f"OCR 초기화 실패: {str(e)}")
-                self.enable_ocr = False
-        
-        # 메모리에 저장된 문서들
+        # 메모리 저장소
         self.documents: Dict[str, DocumentMeta] = {}
-        self.pages: Dict[str, List[PageInfo]] = {}  # doc_id -> pages
-        self.indexes: Dict[str, VectorStoreIndex] = {}  # doc_id -> index
+        self.indexes: Dict[str, VectorStoreIndex] = {}
+        self.slide_images: Dict[str, List[Dict[str, Any]]] = {}
+        self.term_dictionaries: Dict[str, TermDictionary] = {}  # 새로 추가
         
-        logger.info(f"MultimodalDocumentAgent 초기화 완료")
-        logger.info(f"  OCR: {'활성화' if self.enable_ocr else '비활성화'}")
-        logger.info(f"  Vision 분석: {'활성화' if self.enable_vision_analysis else '비활성화'}")
+        logger.info(f"DocumentAgent 초기화 완료")
+        logger.info(f"  Vision Model: {vision_model}")
+        logger.info(f"  Embedding Model: {embedding_model}")
     
-    async def parse_document(self, file_path: str) -> DocumentMeta:
+    async def process_document(self, file_path: str) -> DocumentMeta:
         """
-        멀티모달 문서 파싱 및 LlamaIndex 인덱싱
-        
-        Args:
-            file_path: 파싱할 문서 파일 경로
-            
-        Returns:
-            DocumentMeta: 파싱된 문서 메타데이터
+        문서 처리 메인 파이프라인 (용어 딕셔너리 포함)
         """
         file_path = Path(file_path)
         
         if not file_path.exists():
             raise FileNotFoundError(f"파일을 찾을 수 없습니다: {file_path}")
         
-        logger.info(f"멀티모달 문서 파싱 시작: {file_path}")
+        logger.info(f" 문서 처리 시작: {file_path}")
         
-        # 문서 ID 생성
+        # 1. 문서 ID 생성
         doc_id = generate_doc_id(str(file_path))
         
-        # 파일 확장자에 따른 파싱
+        # 2. 슬라이드 이미지 변환
+        slide_images = await self._convert_to_slide_images(file_path, doc_id)
+        
+        # 3. GPT 캡션 생성
+        captioned_slides = await self._generate_captions(slide_images)
+        
+        # 4. 용어/심볼 딕셔너리 구축 (새로 추가)
+        term_dictionary = await self._build_term_dictionary(captioned_slides, doc_id)
+        
+        # 5. Document 객체 생성 및 인덱싱
+        documents = await self._create_documents(captioned_slides, doc_id)
+        
+        # 6. 벡터 인덱스 구축
+        index = await self._build_vector_index(documents)
+        
+        # 7. 문서 메타데이터 생성
+        doc_meta = DocumentMeta(
+            doc_id=doc_id,
+            title=self._extract_title(file_path.stem, captioned_slides),
+            doc_type=file_path.suffix.lower().replace('.', ''),
+            total_pages=len(slide_images),
+            file_path=str(file_path)
+        )
+        
+        # 8. 메모리에 저장
+        self.documents[doc_id] = doc_meta
+        self.indexes[doc_id] = index
+        self.slide_images[doc_id] = captioned_slides
+        self.term_dictionaries[doc_id] = term_dictionary  # 새로 추가
+        
+        logger.info(f" 문서 처리 완료: {doc_id}")
+        logger.info(f"  총 {len(slide_images)} 슬라이드 처리됨")
+        logger.info(f"  심볼: {len(term_dictionary.symbols)}개, 용어: {len(term_dictionary.terms)}개")
+        
+        return doc_meta
+    
+    async def _build_term_dictionary(self, captioned_slides: List[Dict[str, Any]], doc_id: str) -> TermDictionary:
+        """용어/심볼 딕셔너리 구축"""
+        logger.info(f"용어 딕셔너리 구축 중: {doc_id}")
+        
+        term_dict = TermDictionary()
+        
+        for slide_data in captioned_slides:
+            try:
+                logger.info(f"용어 추출: {slide_data['page_id']}")
+                
+                # Vision LLM으로 용어/심볼 추출
+                extracted_items = await self._extract_terms_and_symbols(slide_data)
+                
+                # 딕셔너리에 추가
+                for item in extracted_items:
+                    if item["type"] == "symbol":
+                        term_dict.add_symbol(
+                            item["text"],
+                            slide_data["page_id"],
+                            item["context"],
+                            item["definition_type"]
+                        )
+                    elif item["type"] == "term":
+                        term_dict.add_term(
+                            item["text"],
+                            slide_data["page_id"],
+                            item["context"],
+                            item["definition_type"]
+                        )
+                
+                # API 레이트 제한
+                await asyncio.sleep(0.2)
+                
+            except Exception as e:
+                logger.warning(f"용어 추출 실패 {slide_data['page_id']}: {str(e)}")
+                continue
+        
+        logger.info(f"용어 딕셔너리 구축 완료: 심볼 {len(term_dict.symbols)}개, 용어 {len(term_dict.terms)}개")
+        return term_dict
+    
+    async def _extract_terms_and_symbols(self, slide_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """슬라이드에서 용어와 심볼 추출"""
+
+        # 캡션 정보 포함
+        context_info = ""
+        if slide_data.get("caption"):
+            context_info += f"\n\n[AI 캡션]\n{slide_data['caption']}"
+
+        if slide_data.get("slide_text"):
+            context_info += f"\n\n[원본 텍스트]\n{slide_data['slide_text']}"
+
+        extraction_prompt = f"""이 교육 슬라이드에서 다음을 추출해주세요:
+
+    **1. 수학 심볼/기호 (Mathematical Symbols)**
+
+    **2. 핵심 용어 (Key Terms)**
+
+    **추출 규칙:**
+    - 각 항목에 대해 슬라이드에서 정의되는지 확인
+    - 정의가 명시적이면 "explicit", 암시적이면 "implicit", 단순 사용이면 "usage"
+    - 해당 항목이 나타나는 문맥 제공
+    - 만약, 별 다른 용어가 없는 슬라이드라면 **반드시 빈 배열 []**을 반환하세요.
+
+    JSON 배열로 반환하세요:
+    [
+        {{
+            "type": "symbol|term",
+            "text": "추출된 심볼/용어",
+            "context": "해당 항목이 나타나는 문맥 (30자 이내)",
+            "definition_type": "explicit|implicit|usage"
+        }}
+    ]
+
+    참고 정보:{context_info}"""
+
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.vision_model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": extraction_prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{slide_data['image_base64']}",
+                                    "detail": self.image_quality
+                                }
+                            }
+                        ]
+                    }
+                ],
+            )
+
+            response_text = response.choices[0].message.content.strip()
+
+            # JSON 블록만 추출
+            if response_text.startswith("```json"):
+                response_text = response_text.split("```json")[1].split("```")[0].strip()
+            elif response_text.startswith("```"):
+                response_text = response_text.split("```")[1].split("```")[0].strip()
+
+            # JSON 파싱
+            extracted_items = json.loads(response_text)
+
+            # 모델이 빈 배열 [] 준 경우 → 정상 처리
+            if not extracted_items:
+                logger.info(f"용어 없음: {slide_data['page_id']}")
+                return []
+
+            # 유효성 검사
+            valid_items = []
+            for item in extracted_items:
+                if all(key in item for key in ["type", "text", "context", "definition_type"]):
+                    if item["type"] in ["symbol", "term"] and item["text"].strip():
+                        valid_items.append(item)
+
+            return valid_items or []  # 유효한 게 없으면 빈 배열 반환
+
+        except json.JSONDecodeError as e:
+            logger.warning(f"용어 추출 JSON 파싱 실패: {response_text[:100]}... - {str(e)}")
+            return []
+        except Exception as e:
+            logger.error(f"용어 추출 실패 {slide_data.get('page_id')}: {str(e)}")
+            return []
+    
+    # 기존 DocumentAgent 메서드들 (동일)
+    async def _convert_to_slide_images(self, file_path: Path, doc_id: str) -> List[Dict[str, Any]]:
+        """파일을 슬라이드 단위 이미지로 변환"""
+        logger.info(f"슬라이드 이미지 변환 중: {file_path}")
+        
+        slide_images = []
+        
         if file_path.suffix.lower() == '.pdf':
-            doc_meta, pages = await self._parse_pdf_multimodal(file_path, doc_id)
+            slide_images = await self._convert_pdf_to_images(file_path, doc_id)
         elif file_path.suffix.lower() in ['.ppt', '.pptx']:
-            doc_meta, pages = await self._parse_ppt_multimodal(file_path, doc_id)
+            slide_images = await self._convert_ppt_to_images(file_path, doc_id)
         else:
             raise ValueError(f"지원하지 않는 파일 형식: {file_path.suffix}")
         
-        # 멀티모달 통계 업데이트
-        doc_meta.total_images = sum(page.image_count for page in pages)
-        doc_meta.total_tables = sum(page.table_count for page in pages)
-        doc_meta.total_charts = sum(page.chart_count for page in pages)
-        
-        # 메모리에 저장
-        self.documents[doc_id] = doc_meta
-        self.pages[doc_id] = pages
-        
-        # 멀티모달 LlamaIndex 인덱스 생성
-        await self._create_multimodal_index(doc_id, pages)
-        
-        logger.info(f"멀티모달 문서 파싱 완료: {doc_id}")
-        logger.info(f"  총 {len(pages)} 페이지, {doc_meta.total_images} 이미지, {doc_meta.total_tables} 표, {doc_meta.total_charts} 차트")
-        return doc_meta
+        logger.info(f"이미지 변환 완료: {len(slide_images)} 슬라이드")
+        return slide_images
     
-    async def _parse_pdf_multimodal(self, file_path: Path, doc_id: str) -> Tuple[DocumentMeta, List[PageInfo]]:
-        """PDF 멀티모달 파싱"""
-        logger.info(f"PDF 멀티모달 파싱 중: {file_path}")
-        
-        pages = []
-        title = None
+    async def _convert_pdf_to_images(self, file_path: Path, doc_id: str) -> List[Dict[str, Any]]:
+        """PDF를 페이지별 이미지로 변환"""
+        slides = []
         
         try:
-            # PyMuPDF로 이미지 추출용
             pdf_doc = fitz.open(file_path)
             
-            with pdfplumber.open(file_path) as pdf:
-                # 첫 페이지에서 제목 추출
-                if pdf.pages:
-                    first_page_text = pdf.pages[0].extract_text() or ""
-                    title = self._extract_title_from_text(first_page_text)
+            for page_num in range(len(pdf_doc)):
+                page = pdf_doc[page_num]
                 
-                # 각 페이지 파싱
-                for page_num, page in enumerate(pdf.pages, 1):
-                    logger.info(f"페이지 {page_num} 파싱 중...")
-                    
-                    # 텍스트 추출
-                    page_text = page.extract_text() or ""
-                    
-                    # 멀티모달 요소들 추출
-                    elements = []
-                    
-                    # 1. 텍스트 요소 추가
-                    if page_text.strip():
-                        text_element = PageElement(
-                            element_id=generate_element_id(f"p{page_num:03d}", ElementType.TEXT, 0),
-                            element_type=ElementType.TEXT,
-                            text_content=page_text,
-                            confidence=1.0
-                        )
-                        elements.append(text_element)
-                    
-                    # 2. 이미지 추출 및 분석
-                    fitz_page = pdf_doc[page_num - 1]
-                    image_elements = await self._extract_images_from_page(
-                        page, fitz_page, f"p{page_num:03d}"
-                    )
-                    elements.extend(image_elements)
-                    
-                    # 3. 표 추출
-                    table_elements = await self._extract_tables_from_page(
-                        page, f"p{page_num:03d}"
-                    )
-                    elements.extend(table_elements)
-                    
-                    # 4. 차트 감지 (이미지 기반)
-                    chart_elements = await self._detect_charts_in_images(
-                        image_elements, f"p{page_num:03d}"
-                    )
-                    elements.extend(chart_elements)
-                    
-                    # PageInfo 생성
-                    page_info = PageInfo(
-                        page_id=f"p{page_num:03d}",
-                        page_number=page_num,
-                        raw_text=page_text,
-                        word_count=len(page_text.split()) if page_text else 0,
-                        elements=elements
-                    )
-                    
-                    pages.append(page_info)
-                    
-                    # 진행상황 로그
-                    if page_num % 5 == 0:
-                        logger.info(f"PDF 파싱 진행: {page_num}/{len(pdf.pages)} 페이지")
-        
+                # 페이지를 이미지로 변환 (300 DPI)
+                mat = fitz.Matrix(300/72, 300/72)
+                pix = page.get_pixmap(matrix=mat)
+                
+                # PIL Image로 변환
+                img_data = pix.pil_tobytes(format="PNG")
+                pil_image = Image.open(BytesIO(img_data))
+                
+                # Base64 인코딩
+                buffered = BytesIO()
+                pil_image.save(buffered, format="PNG")
+                img_base64 = base64.b64encode(buffered.getvalue()).decode()
+                
+                slide_data = {
+                    "doc_id": doc_id,
+                    "page_id": f"p{page_num + 1:03d}",
+                    "page_number": page_num + 1,
+                    "image_base64": img_base64,
+                    "dimensions": pil_image.size,
+                    "size_bytes": len(img_data),
+                    "caption": None
+                }
+                
+                slides.append(slide_data)
+                pix = None
+                
         except Exception as e:
-            logger.error(f"PDF 파싱 실패: {str(e)}")
+            logger.error(f"PDF 변환 실패: {str(e)}")
             raise
         finally:
             if 'pdf_doc' in locals():
                 pdf_doc.close()
         
-        # 문서 메타데이터 생성
-        doc_meta = DocumentMeta(
-            doc_id=doc_id,
-            title=title or file_path.stem,
-            doc_type="pdf",
-            total_pages=len(pages),
-            file_path=str(file_path)
-        )
-        
-        return doc_meta, pages
+        return slides
     
-    async def _parse_ppt_multimodal(self, file_path: Path, doc_id: str) -> Tuple[DocumentMeta, List[PageInfo]]:
-        """PowerPoint 멀티모달 파싱"""
-        logger.info(f"PPT 멀티모달 파싱 중: {file_path}")
-        
-        pages = []
-        title = None
+    async def _convert_ppt_to_images(self, file_path: Path, doc_id: str) -> List[Dict[str, Any]]:
+        """PowerPoint를 슬라이드별 이미지로 변환"""
+        slides = []
         
         try:
             prs = Presentation(file_path)
             
-            # 첫 슬라이드에서 제목 추출
-            if prs.slides:
-                first_slide_text = self._extract_slide_text(prs.slides[0])
-                title = self._extract_title_from_text(first_slide_text)
-            
-            # 각 슬라이드 파싱
             for slide_num, slide in enumerate(prs.slides, 1):
-                logger.info(f"슬라이드 {slide_num} 파싱 중...")
-                
-                elements = []
-                slide_text_parts = []
-                
-                # 슬라이드 내 모든 shape 분석
-                element_index = 0
-                
+                # 슬라이드 텍스트 추출
+                slide_text = ""
                 for shape in slide.shapes:
-                    if hasattr(shape, "text") and shape.text.strip():
-                        # 텍스트 요소
-                        text_element = PageElement(
-                            element_id=generate_element_id(f"slide_{slide_num:03d}", ElementType.TEXT, element_index),
-                            element_type=ElementType.TEXT,
-                            bbox=self._shape_to_bbox(shape),
-                            text_content=shape.text.strip(),
-                            confidence=1.0
-                        )
-                        elements.append(text_element)
-                        slide_text_parts.append(shape.text.strip())
-                        element_index += 1
-                    
-                    elif shape.shape_type == 13: # msoPicture
-                        # 이미지 요소
-                        image_element = await self._extract_ppt_image(
-                            shape, f"slide_{slide_num:03d}", element_index
-                        )
-                        if image_element:
-                            elements.append(image_element)
-                            element_index += 1
-                    
-                    elif shape.has_table:
-                        # 표 요소
-                        table_element = await self._extract_ppt_table(
-                            shape.table, f"slide_{slide_num:03d}", element_index
-                        )
-                        if table_element:
-                            elements.append(table_element)
-                            element_index += 1
+                    if hasattr(shape, "text") and shape.text:
+                        slide_text += shape.text + "\n"
                 
-                # 전체 슬라이드 텍스트
-                slide_text = "\n".join(slide_text_parts)
+                # 임시 이미지 생성
+                dummy_image = Image.new('RGB', (1920, 1080), color='white')
                 
-                # PageInfo 생성
-                page_info = PageInfo(
-                    page_id=f"slide_{slide_num:03d}",
-                    page_number=slide_num,
-                    raw_text=slide_text,
-                    word_count=len(slide_text.split()) if slide_text else 0,
-                    elements=elements
-                )
+                buffered = BytesIO()
+                dummy_image.save(buffered, format="PNG")
+                img_base64 = base64.b64encode(buffered.getvalue()).decode()
                 
-                pages.append(page_info)
+                slide_data = {
+                    "doc_id": doc_id,
+                    "page_id": f"slide_{slide_num:03d}",
+                    "page_number": slide_num,
+                    "image_base64": img_base64,
+                    "dimensions": (1920, 1080),
+                    "size_bytes": len(buffered.getvalue()),
+                    "slide_text": slide_text,
+                    "caption": None
+                }
+                
+                slides.append(slide_data)
         
         except Exception as e:
-            logger.error(f"PPT 파싱 실패: {str(e)}")
+            logger.error(f"PPT 변환 실패: {str(e)}")
             raise
         
-        # 문서 메타데이터 생성
-        doc_meta = DocumentMeta(
-            doc_id=doc_id,
-            title=title or file_path.stem,
-            doc_type="ppt",
-            total_pages=len(pages),
-            file_path=str(file_path)
-        )
-        
-        return doc_meta, pages
+        return slides
     
-    async def _extract_images_from_page(self, pdfplumber_page, fitz_page, page_id: str) -> List[PageElement]:
-        """PDF 페이지에서 이미지 추출 및 분석"""
-        elements = []
+    async def _generate_captions(self, slide_images: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """슬라이드 이미지들에 대해 GPT 캡션 생성"""
+        logger.info(f"GPT 캡션 생성 중: {len(slide_images)} 슬라이드")
         
-        try:
-            # PyMuPDF로 이미지 추출
-            image_list = fitz_page.get_images()
-            
-            for img_index, img in enumerate(image_list):
-                try:
-                    # 이미지 데이터 추출
-                    xref = img[0]
-                    pix = fitz.Pixmap(fitz_page.parent, xref)
-                    
-                    if pix.n - pix.alpha < 4:  # GRAY or RGB
-                        img_data = pix.pil_tobytes(format="PNG")
-                        pil_image = Image.open(BytesIO(img_data))
-                        
-                        # 이미지를 base64로 인코딩
-                        buffered = BytesIO()
-                        pil_image.save(buffered, format="PNG")
-                        img_base64 = base64.b64encode(buffered.getvalue()).decode()
-                        
-                        # 이미지 분석
-                        image_analysis = await self._analyze_image(pil_image, img_base64)
-                        
-                        # 이미지 요소 생성
-                        image_element = PageElement(
-                            element_id=generate_element_id(page_id, ElementType.IMAGE, img_index),
-                            element_type=ElementType.IMAGE,
-                            bbox=BoundingBox(x=0, y=0, width=pil_image.width, height=pil_image.height),
-                            image_data=ImageElement(
-                                element_id=generate_element_id(page_id, ElementType.IMAGE, img_index),
-                                bbox=BoundingBox(x=0, y=0, width=pil_image.width, height=pil_image.height),
-                                format="png",
-                                size_bytes=len(img_data),
-                                dimensions=(pil_image.width, pil_image.height),
-                                ocr_text=image_analysis.get("ocr_text"),
-                                description=image_analysis.get("description"),
-                                image_data=f"data:image/png;base64,{img_base64}"
-                            ),
-                            confidence=image_analysis.get("confidence", 0.8)
-                        )
-                        
-                        elements.append(image_element)
-                        
-                    pix = None  # 메모리 해제
-                    
-                except Exception as e:
-                    logger.warning(f"이미지 {img_index} 처리 실패: {str(e)}")
+        captioned_slides = []
         
-        except Exception as e:
-            logger.warning(f"페이지 이미지 추출 실패: {str(e)}")
-        
-        return elements
-    
-    async def _analyze_image(self, pil_image: Image.Image, img_base64: str) -> Dict[str, Any]:
-        """이미지 분석 (OCR + Vision LLM)"""
-        analysis = {
-            "ocr_text": None,
-            "description": None,
-            "confidence": 0.5
-        }
-        
-        # 1. OCR 분석
-        if self.enable_ocr and self.ocr_reader:
+        for i, slide_data in enumerate(slide_images):
             try:
-                # PIL Image를 numpy array로 변환
-                import numpy as np
-                img_array = np.array(pil_image)
+                logger.info(f"캡션 생성: {slide_data['page_id']} ({i+1}/{len(slide_images)})")
                 
-                ocr_results = self.ocr_reader.readtext(img_array)
-                if ocr_results:
-                    ocr_texts = [result[1] for result in ocr_results if result[2] > 0.5]
-                    analysis["ocr_text"] = " ".join(ocr_texts)
-                    analysis["confidence"] = max(analysis["confidence"], 0.7)
+                caption = await self._generate_single_caption(slide_data)
+                
+                slide_data_with_caption = slide_data.copy()
+                slide_data_with_caption["caption"] = caption
+                
+                captioned_slides.append(slide_data_with_caption)
+                
+                await asyncio.sleep(0.1)
                 
             except Exception as e:
-                logger.warning(f"OCR 분석 실패: {str(e)}")
+                logger.warning(f"캡션 생성 실패 {slide_data['page_id']}: {str(e)}")
+                slide_data_with_caption = slide_data.copy()
+                slide_data_with_caption["caption"] = f"슬라이드 {slide_data['page_number']}"
+                captioned_slides.append(slide_data_with_caption)
         
-        # 2. Vision LLM 분석
-        if self.enable_vision_analysis and self.vision_llm:
-            try:
-                description = await self._get_image_description(img_base64)
-                if description:
-                    analysis["description"] = description
-                    analysis["confidence"] = max(analysis["confidence"], 0.8)
-                
-            except Exception as e:
-                logger.warning(f"Vision LLM 분석 실패: {str(e)}")
-        
-        return analysis
+        logger.info(f"캡션 생성 완료: {len(captioned_slides)} 슬라이드")
+        return captioned_slides
     
-    async def _get_image_description(self, img_base64: str) -> Optional[str]:
-        """Vision LLM으로 이미지 설명 생성"""
-        if not self.vision_llm:
-            return None
+    async def _generate_single_caption(self, slide_data: Dict[str, Any]) -> str:
+        """단일 슬라이드에 대한 GPT 캡션 생성"""
         
-        try:
-            prompt = """이 이미지를 교육 콘텐츠 검수 관점에서 간단히 설명해주세요.
-            
-다음 정보를 포함해주세요:
-- 이미지 타입 (다이어그램, 차트, 사진, 스크린샷 등)
-- 주요 내용 (한 줄 요약)
-- 텍스트가 있다면 주요 내용
-- 교육적 목적 (설명, 예시, 데이터 등)
+        context = ""
+        if "slide_text" in slide_data and slide_data["slide_text"].strip():
+            context = f"\n\n슬라이드 텍스트:\n{slide_data['slide_text']}"
+        
+        prompt = f"""이 교육자료 슬라이드를 2~3문장으로 요약하고 설명하세요.
 
-간단하고 명확하게 작성해주세요."""
-            
-            # OpenAI Vision API는 별도 구현 필요
-            # 현재는 플레이스홀더
-            response = await self._call_vision_api(prompt, img_base64)
-            return response
-            
-        except Exception as e:
-            logger.warning(f"이미지 설명 생성 실패: {str(e)}")
-            return None
-    
-    async def _call_vision_api(self, prompt: str, img_base64: str) -> Optional[str]:
-        """Vision API 호출 (OpenAI GPT-4V)"""
-        # 실제 구현에서는 OpenAI의 vision API를 호출
-        # 현재는 더미 응답
-        await asyncio.sleep(0.1)  # API 호출 시뮬레이션
-        return "다이어그램: 신경망 구조를 보여주는 교육용 이미지"
-    
-    async def _extract_tables_from_page(self, page, page_id: str) -> List[PageElement]:
-        """PDF 페이지에서 표 추출"""
-        elements = []
-        
+다음 내용을 포함해주세요:
+- 슬라이드의 주요 주제/내용
+- 핵심 개념이나 정보
+- 교육적 목적이나 의도
+
+간단하고 명확하게 작성해주세요.{context}"""
+
         try:
-            tables = page.extract_tables()
-            
-            for table_index, table_data in enumerate(tables):
-                if not table_data or len(table_data) < 2:
-                    continue
-                
-                # 헤더와 데이터 분리
-                headers = table_data[0] if table_data else []
-                rows = table_data[1:] if len(table_data) > 1 else []
-                
-                # None 값 정리
-                headers = [str(cell) if cell is not None else "" for cell in headers]
-                clean_rows = []
-                for row in rows:
-                    clean_row = [str(cell) if cell is not None else "" for cell in row]
-                    clean_rows.append(clean_row)
-                
-                table_element = PageElement(
-                    element_id=generate_element_id(page_id, ElementType.TABLE, table_index),
-                    element_type=ElementType.TABLE,
-                    table_data=TableElement(
-                        element_id=generate_element_id(page_id, ElementType.TABLE, table_index),
-                        headers=headers,
-                        rows=clean_rows,
-                        extraction_confidence=0.9
-                    ),
-                    confidence=0.9
-                )
-                
-                elements.append(table_element)
-        
-        except Exception as e:
-            logger.warning(f"표 추출 실패: {str(e)}")
-        
-        return elements
-    
-    async def _detect_charts_in_images(self, image_elements: List[PageElement], page_id: str) -> List[PageElement]:
-        """이미지에서 차트 감지"""
-        chart_elements = []
-        
-        for img_element in image_elements:
-            if not img_element.image_data or not img_element.image_data.description:
-                continue
-            
-            description = img_element.image_data.description.lower()
-            
-            # 간단한 키워드 기반 차트 감지
-            chart_keywords = ["차트", "그래프", "도표", "chart", "graph", "plot"]
-            
-            if any(keyword in description for keyword in chart_keywords):
-                # 차트 요소로 변환
-                chart_element = PageElement(
-                    element_id=img_element.element_id.replace("image", "chart"),
-                    element_type=ElementType.CHART,
-                    bbox=img_element.bbox,
-                    chart_data=ChartElement(
-                        element_id=img_element.element_id.replace("image", "chart"),
-                        bbox=img_element.bbox,
-                        chart_type="unknown",
-                        description=img_element.image_data.description
-                    ),
-                    confidence=0.7
-                )
-                
-                chart_elements.append(chart_element)
-        
-        return chart_elements
-    
-    async def _extract_ppt_image(self, shape, page_id: str, element_index: int) -> Optional[PageElement]:
-        """PPT에서 이미지 추출"""
-        try:
-            # PPT 이미지 처리는 복잡하므로 기본 구현만
-            image_element = PageElement(
-                element_id=generate_element_id(page_id, ElementType.IMAGE, element_index),
-                element_type=ElementType.IMAGE,
-                bbox=self._shape_to_bbox(shape),
-                image_data=ImageElement(
-                    element_id=generate_element_id(page_id, ElementType.IMAGE, element_index),
-                    bbox=self._shape_to_bbox(shape),
-                    format="unknown",
-                    size_bytes=0,
-                    dimensions=(100, 100),
-                    description="PPT 이미지"
-                ),
-                confidence=0.6
+            response = await self.client.chat.completions.create(
+                model=self.vision_model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": prompt
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{slide_data['image_base64']}",
+                                    "detail": self.image_quality
+                                }
+                            }
+                        ]
+                    }
+                ],
+                temperature=0.3,
+                max_tokens=200
             )
             
-            return image_element
+            caption = response.choices[0].message.content.strip()
+            return caption
             
         except Exception as e:
-            logger.warning(f"PPT 이미지 추출 실패: {str(e)}")
-            return None
+            logger.error(f"GPT 캡션 생성 실패: {str(e)}")
+            return f"슬라이드 {slide_data['page_number']} - 교육자료 내용"
     
-    async def _extract_ppt_table(self, table, page_id: str, element_index: int) -> Optional[PageElement]:
-        """PPT에서 표 추출"""
-        try:
-            headers, rows = [], []
-
-            # 👇 슬라이싱(table.rows[1:]) 절대 쓰지 마세요.
-            row_list = list(table.rows)  # 안전하게 파이썬 리스트로 복제
-
-            if len(row_list) == 0:
-                return None
-
-            # 첫 행을 헤더로
-            first_row = row_list[0]
-            headers = [cell.text.strip() for cell in first_row.cells]
-
-            # 나머지는 데이터
-            for r in row_list[1:]:
-                rows.append([cell.text.strip() for cell in r.cells])
-
-            table_element = PageElement(
-                element_id=generate_element_id(page_id, ElementType.TABLE, element_index),
-                element_type=ElementType.TABLE,
-                table_data=TableElement(
-                    element_id=generate_element_id(page_id, ElementType.TABLE, element_index),
-                    headers=headers,
-                    rows=rows,
-                    extraction_confidence=0.8
-                ),
-                confidence=0.8
-            )
-            return table_element
-
-        except Exception as e:
-            logger.warning(f"PPT 표 추출 실패: {e!r}")  # repr로 에러 원인 더 명확히
-            return None
-    
-    def _emu_to_px(self, emu_val: Any, dpi: int = 96) -> int:
-        # 1 inch = 914400 EMU, 96 px/inch
-        try:
-            emu = int(emu_val)
-        except Exception:
-            emu = int(float(emu_val))
-        px = int(round(emu * dpi / 914400))
-        return max(0, px)  # 음수 방지
-
-    def _shape_to_bbox(self, shape) -> BoundingBox:
-        x = self._emu_to_px(shape.left)
-        y = self._emu_to_px(shape.top)
-        w = max(1, self._emu_to_px(shape.width))   # 0 방지
-        h = max(1, self._emu_to_px(shape.height))  # 0 방지
-        return BoundingBox(x=x, y=y, width=w, height=h)
-    
-    def _extract_slide_text(self, slide) -> str:
-        """슬라이드에서 모든 텍스트 추출"""
-        texts = []
-        
-        for shape in slide.shapes:
-            if hasattr(shape, "text") and shape.text:
-                texts.append(shape.text.strip())
-        
-        return "\n".join(texts)
-    
-    def _extract_title_from_text(self, text: str) -> Optional[str]:
-        """텍스트에서 제목 추출"""
-        if not text:
-            return None
-        
-        lines = text.strip().split('\n')
-        first_line = lines[0].strip()
-        
-        if 5 <= len(first_line) <= 100:
-            return first_line
-        
-        return None
-    
-    async def _create_multimodal_index(self, doc_id: str, pages: List[PageInfo]):
-        """멀티모달 요소를 포함한 LlamaIndex 생성"""
-        logger.info(f"멀티모달 인덱스 생성 중: {doc_id}")
+    async def _create_documents(self, captioned_slides: List[Dict[str, Any]], doc_id: str) -> List[Document]:
+        """캡션이 있는 슬라이드들을 LlamaIndex Document 객체로 변환"""
+        logger.info(f"Document 객체 생성 중: {len(captioned_slides)} 슬라이드")
         
         documents = []
         
-        for page in pages:
-            # 각 요소를 별도 문서로 인덱싱
-            for element in page.elements:
-                text_content = ""
-                
-                if element.element_type == ElementType.TEXT:
-                    text_content = element.text_content or ""
-                
-                elif element.element_type == ElementType.IMAGE:
-                    # 이미지의 OCR 텍스트와 설명 결합
-                    parts = []
-                    if element.image_data and element.image_data.ocr_text:
-                        parts.append(f"[OCR] {element.image_data.ocr_text}")
-                    if element.image_data and element.image_data.description:
-                        parts.append(f"[설명] {element.image_data.description}")
-                    text_content = " ".join(parts)
-                
-                elif element.element_type == ElementType.TABLE:
-                    # 표 데이터를 텍스트로 변환
-                    if element.table_data:
-                        parts = []
-                        if element.table_data.headers:
-                            parts.append(f"[헤더] {' | '.join(element.table_data.headers)}")
-                        for row in element.table_data.rows:
-                            parts.append(f"[행] {' | '.join(row)}")
-                        text_content = "\n".join(parts)
-                
-                elif element.element_type == ElementType.CHART:
-                    # 차트 설명
-                    if element.chart_data and element.chart_data.description:
-                        text_content = f"[차트] {element.chart_data.description}"
-                
-                if text_content.strip():
-                    doc = Document(
-                        text=text_content,
-                        metadata={
-                            "doc_id": doc_id,
-                            "page_id": page.page_id,
-                            "page_number": page.page_number,
-                            "element_id": element.element_id,
-                            "element_type": element.element_type.value,
-                            "confidence": element.confidence
-                        }
-                    )
-                    documents.append(doc)
-        
-        if not documents:
-            logger.warning(f"인덱싱할 콘텐츠가 없습니다: {doc_id}")
-            return
-        
-        try:
-            # 멀티모달 벡터 인덱스 생성
-            index = VectorStoreIndex.from_documents(
-                documents,
-                embed_model=self.embeddings,
-                transformations=[self.text_splitter]
+        for slide_data in captioned_slides:
+            text_content = slide_data["caption"]
+            
+            if "slide_text" in slide_data and slide_data["slide_text"].strip():
+                text_content += f"\n\n원본 텍스트:\n{slide_data['slide_text']}"
+            
+            metadata = {
+                "doc_id": doc_id,
+                "page_id": slide_data["page_id"],
+                "page_number": slide_data["page_number"],
+                "image_path": None,
+                "dimensions": slide_data["dimensions"],
+                "size_bytes": slide_data["size_bytes"],
+                "has_caption": bool(slide_data["caption"])
+            }
+            
+            doc = Document(
+                text=text_content,
+                metadata=metadata
             )
             
-            self.indexes[doc_id] = index
-            logger.info(f"멀티모달 인덱스 생성 완료: {doc_id} ({len(documents)} 요소)")
+            documents.append(doc)
+        
+        logger.info(f"Document 객체 생성 완료: {len(documents)}개")
+        return documents
+    
+    async def _build_vector_index(self, documents: List[Document]) -> VectorStoreIndex:
+        """Document 리스트로부터 벡터 인덱스 구축"""
+        logger.info(f"벡터 인덱스 구축 중: {len(documents)} 문서")
+        
+        try:
+            index = VectorStoreIndex.from_documents(
+                documents,
+                embed_model=self.embeddings
+            )
+            
+            logger.info("벡터 인덱스 구축 완료")
+            return index
             
         except Exception as e:
-            logger.error(f"인덱스 생성 실패: {str(e)}")
+            logger.error(f"벡터 인덱스 구축 실패: {str(e)}")
             raise
     
-    # 기존 DocumentAgent의 메서드들 유지
+    def _extract_title(self, filename: str, slides: List[Dict[str, Any]]) -> str:
+        """문서 제목 추출"""
+        if slides and slides[0].get("caption"):
+            first_caption = slides[0]["caption"]
+            sentences = first_caption.split('.')
+            if sentences and len(sentences[0]) < 100:
+                return sentences[0].strip()
+        
+        return filename.replace('_', ' ').replace('-', ' ')
+    
+    # 기존 조회 메서드들 + 용어 딕셔너리 관련 메서드 추가
+    
     def get_document(self, doc_id: str) -> Optional[DocumentMeta]:
         """문서 메타데이터 조회"""
         return self.documents.get(doc_id)
-    
-    def get_pages(self, doc_id: str) -> List[PageInfo]:
-        """문서의 페이지 목록 조회"""
-        return self.pages.get(doc_id, [])
     
     def get_index(self, doc_id: str) -> Optional[VectorStoreIndex]:
         """문서의 벡터 인덱스 조회"""
         return self.indexes.get(doc_id)
     
+    def get_slide_data(self, doc_id: str) -> List[Dict[str, Any]]:
+        """슬라이드 원본 데이터 조회"""
+        return self.slide_images.get(doc_id, [])
+    
+    def get_term_dictionary(self, doc_id: str) -> Optional[TermDictionary]:
+        """용어 딕셔너리 조회"""
+        return self.term_dictionaries.get(doc_id)
+    
+    def get_slide_context(self, doc_id: str, page_id: str, terms_symbols: Set[str]) -> Dict[str, Any]:
+        """특정 슬라이드의 용어/심볼 컨텍스트 조회"""
+        term_dict = self.get_term_dictionary(doc_id)
+        if not term_dict:
+            return {}
+        
+        return term_dict.get_context_for_slide(page_id, terms_symbols)
+    
     def search_in_document(self, doc_id: str, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        """멀티모달 문서 내 검색"""
+        """문서 내 의미적 검색"""
         index = self.get_index(doc_id)
         if not index:
             return []
         
         try:
-            # 쿼리 엔진 생성
             query_engine = index.as_query_engine(similarity_top_k=top_k)
-            
-            # 검색 수행
             response = query_engine.query(query)
             
-            # 결과 정리
             results = []
             for node in response.source_nodes:
-                results.append({
+                result = {
                     "text": node.text,
-                    "score": node.score,
+                    "score": getattr(node, 'score', 0.0),
                     "metadata": node.metadata,
                     "page_id": node.metadata.get("page_id"),
-                    "page_number": node.metadata.get("page_number"),
-                    "element_id": node.metadata.get("element_id"),
-                    "element_type": node.metadata.get("element_type"),
-                    "confidence": node.metadata.get("confidence")
-                })
+                    "page_number": node.metadata.get("page_number")
+                }
+                results.append(result)
             
             return results
             
         except Exception as e:
-            logger.error(f"멀티모달 문서 검색 실패: {str(e)}")
+            logger.error(f"문서 검색 실패: {str(e)}")
             return []
     
-    def search_by_element_type(self, doc_id: str, element_type: ElementType, query: str = None) -> List[PageElement]:
-        """요소 타입별 검색"""
-        pages = self.get_pages(doc_id)
-        if not pages:
-            return []
+    def get_slide_by_page_id(self, doc_id: str, page_id: str) -> Optional[Dict[str, Any]]:
+        """특정 슬라이드 데이터 조회"""
+        slides = self.get_slide_data(doc_id)
         
-        results = []
-        for page in pages:
-            for element in page.elements:
-                if element.element_type == element_type:
-                    # 쿼리가 있는 경우 텍스트 매칭
-                    if query:
-                        element_text = ""
-                        if element.element_type == ElementType.TEXT:
-                            element_text = element.text_content or ""
-                        elif element.element_type == ElementType.IMAGE and element.image_data:
-                            element_text = f"{element.image_data.ocr_text or ''} {element.image_data.description or ''}"
-                        elif element.element_type == ElementType.TABLE and element.table_data:
-                            element_text = f"{' '.join(element.table_data.headers)} {' '.join([' '.join(row) for row in element.table_data.rows])}"
-                        elif element.element_type == ElementType.CHART and element.chart_data:
-                            element_text = element.chart_data.description or ""
-                        
-                        if query.lower() in element_text.lower():
-                            results.append(element)
-                    else:
-                        results.append(element)
+        for slide in slides:
+            if slide["page_id"] == page_id:
+                return slide
         
-        return results
-    
-    def get_multimodal_stats(self, doc_id: str) -> Dict[str, Any]:
-        """멀티모달 문서 통계"""
-        doc_meta = self.get_document(doc_id)
-        pages = self.get_pages(doc_id)
-        
-        if not doc_meta or not pages:
-            return {}
-        
-        # 요소별 통계 계산
-        element_stats = {
-            "text": 0,
-            "image": 0,
-            "table": 0,
-            "chart": 0,
-            "total": 0
-        }
-        
-        total_words = 0
-        total_chars = 0
-        ocr_text_count = 0
-        ai_descriptions = 0
-        
-        for page in pages:
-            total_words += page.word_count
-            total_chars += len(page.raw_text)
-            
-            for element in page.elements:
-                element_stats["total"] += 1
-                
-                if element.element_type == ElementType.TEXT:
-                    element_stats["text"] += 1
-                elif element.element_type == ElementType.IMAGE:
-                    element_stats["image"] += 1
-                    if element.image_data:
-                        if element.image_data.ocr_text:
-                            ocr_text_count += 1
-                        if element.image_data.description:
-                            ai_descriptions += 1
-                elif element.element_type == ElementType.TABLE:
-                    element_stats["table"] += 1
-                elif element.element_type == ElementType.CHART:
-                    element_stats["chart"] += 1
-        
-        return {
-            "doc_id": doc_id,
-            "title": doc_meta.title,
-            "total_pages": len(pages),
-            "total_words": total_words,
-            "total_chars": total_chars,
-            "avg_words_per_page": total_words / len(pages) if pages else 0,
-            "has_index": doc_id in self.indexes,
-            "elements": element_stats,
-            "multimodal_features": {
-                "ocr_enabled": self.enable_ocr,
-                "vision_analysis_enabled": self.enable_vision_analysis,
-                "ocr_text_extracted": ocr_text_count,
-                "ai_descriptions_generated": ai_descriptions
-            }
-        }
+        return None
     
     def list_documents(self) -> List[DocumentMeta]:
         """모든 문서 목록 조회"""
         return list(self.documents.values())
     
-    async def get_page_summary(self, doc_id: str, page_id: str) -> Dict[str, Any]:
-        """페이지 요약 정보"""
-        pages = self.get_pages(doc_id)
-        target_page = None
+    def get_document_stats(self, doc_id: str) -> Dict[str, Any]:
+        """문서 통계 정보 (용어 딕셔너리 포함)"""
+        doc_meta = self.get_document(doc_id)
+        slides = self.get_slide_data(doc_id)
+        term_dict = self.get_term_dictionary(doc_id)
         
-        for page in pages:
-            if page.page_id == page_id:
-                target_page = page
-                break
-        
-        if not target_page:
+        if not doc_meta or not slides:
             return {}
         
-        # 요소별 요약
-        summary = {
-            "page_id": page_id,
-            "page_number": target_page.page_number,
-            "word_count": target_page.word_count,
-            "element_counts": {
-                "text": target_page.text_count,
-                "image": target_page.image_count,
-                "table": target_page.table_count,
-                "chart": target_page.chart_count
-            },
-            "elements": []
-        }
+        # 캡션 통계
+        captioned_slides = sum(1 for slide in slides if slide.get("caption"))
+        total_caption_chars = sum(len(slide.get("caption", "")) for slide in slides)
         
-        # 각 요소의 요약 정보
-        for element in target_page.elements:
-            element_summary = {
-                "element_id": element.element_id,
-                "element_type": element.element_type.value,
-                "confidence": element.confidence
+        # 이미지 통계
+        total_image_size = sum(slide.get("size_bytes", 0) for slide in slides)
+        avg_dimensions = (
+            sum(slide.get("dimensions", [0, 0])[0] for slide in slides) / len(slides),
+            sum(slide.get("dimensions", [0, 0])[1] for slide in slides) / len(slides)
+        ) if slides else (0, 0)
+        
+        # 용어 딕셔너리 통계
+        term_stats = {}
+        if term_dict:
+            term_stats = {
+                "total_symbols": len(term_dict.symbols),
+                "total_terms": len(term_dict.terms),
+                "explicit_definitions": sum(
+                    len([d for d in defs if d.definition_type == "explicit"]) 
+                    for defs in list(term_dict.symbols.values()) + list(term_dict.terms.values())
+                ),
+                "most_frequent_symbols": sorted(
+                    term_dict.symbols.items(), 
+                    key=lambda x: len(x[1]), 
+                    reverse=True
+                )[:5],
+                "most_frequent_terms": sorted(
+                    term_dict.terms.items(), 
+                    key=lambda x: len(x[1]), 
+                    reverse=True
+                )[:5]
             }
-            
-            if element.element_type == ElementType.TEXT:
-                element_summary["preview"] = (element.text_content or "")[:100]
-            elif element.element_type == ElementType.IMAGE and element.image_data:
-                element_summary["description"] = element.image_data.description
-                element_summary["has_ocr"] = bool(element.image_data.ocr_text)
-            elif element.element_type == ElementType.TABLE and element.table_data:
-                element_summary["dimensions"] = f"{element.table_data.row_count}x{element.table_data.col_count}"
-                element_summary["has_headers"] = element.table_data.has_headers
-            elif element.element_type == ElementType.CHART and element.chart_data:
-                element_summary["chart_type"] = element.chart_data.chart_type
-                element_summary["description"] = element.chart_data.description
-            
-            summary["elements"].append(element_summary)
         
-        return summary
+        return {
+            "doc_id": doc_id,
+            "title": doc_meta.title,
+            "doc_type": doc_meta.doc_type,
+            "total_slides": len(slides),
+            "captioned_slides": captioned_slides,
+            "caption_coverage": captioned_slides / len(slides) if slides else 0,
+            "total_caption_chars": total_caption_chars,
+            "avg_caption_length": total_caption_chars / captioned_slides if captioned_slides else 0,
+            "total_image_size_mb": total_image_size / (1024 * 1024),
+            "avg_dimensions": avg_dimensions,
+            "has_index": doc_id in self.indexes,
+            "term_dictionary": term_stats
+        }
+    
+    def export_term_dictionary(self, doc_id: str, output_path: Optional[str] = None) -> Optional[str]:
+        """용어 딕셔너리를 JSON 파일로 내보내기"""
+        term_dict = self.get_term_dictionary(doc_id)
+        if not term_dict:
+            return None
+        
+        if not output_path:
+            output_path = f"{doc_id}_term_dictionary.json"
+        
+        try:
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump(term_dict.to_dict(), f, ensure_ascii=False, indent=2)
+            
+            logger.info(f"용어 딕셔너리 내보내기 완료: {output_path}")
+            return output_path
+            
+        except Exception as e:
+            logger.error(f"용어 딕셔너리 내보내기 실패: {str(e)}")
+            return None
 
 
 # 테스트 함수
-async def test_multimodal_agent():
-    """MultimodalDocumentAgent 테스트"""
-    print("🧪 MultimodalDocumentAgent 테스트 시작...")
+async def test_document_agent():
+    """DocumentAgent 테스트"""
+    print("🧪  DocumentAgent 테스트 시작...")
     
-    # 에이전트 생성
-    import os
+    # 환경변수에서 API 키 확인
     api_key = os.getenv("OPENAI_API_KEY")
-    
     if not api_key:
-        print("⚠️  OPENAI_API_KEY 환경변수가 설정되지 않았습니다.")
-        print("   멀티모달 기능 일부가 제한됩니다.")
+        print("❌ OPENAI_API_KEY 환경변수가 설정되지 않았습니다.")
+        return
     
-    agent = MultimodalDocumentAgent(
-        openai_api_key=api_key,
-        enable_ocr=True,
-        enable_vision_analysis=bool(api_key)
-    )
-    
-    # 테스트 파일들
+    # 테스트할 파일 찾기
     test_files = [
-        "Ch01_intro.pdf",
-        "Ch01_intro.pptx"
+        "sample_docs/sample.pdf", 
     ]
     
-    for test_file in test_files:
-        if Path(test_file).exists():
-            try:
-                print(f"\n📄 멀티모달 파싱 테스트: {test_file}")
-                
-                # 문서 파싱
-                doc_meta = await agent.parse_document(test_file)
-                
-                print(f"✅ 파싱 성공!")
-                print(f"   문서 ID: {doc_meta.doc_id}")
-                print(f"   제목: {doc_meta.title}")
-                print(f"   페이지 수: {doc_meta.total_pages}")
-                print(f"   이미지: {doc_meta.total_images}개")
-                print(f"   표: {doc_meta.total_tables}개")
-                print(f"   차트: {doc_meta.total_charts}개")
-                
-                # 멀티모달 통계
-                stats = agent.get_multimodal_stats(doc_meta.doc_id)
-                print(f"   총 요소: {stats['elements']['total']}개")
-                print(f"   OCR 추출: {stats['multimodal_features']['ocr_text_extracted']}개")
-                print(f"   AI 설명: {stats['multimodal_features']['ai_descriptions_generated']}개")
-                
-                # 요소 타입별 검색 테스트
-                images = agent.search_by_element_type(doc_meta.doc_id, ElementType.IMAGE)
-                tables = agent.search_by_element_type(doc_meta.doc_id, ElementType.TABLE)
-                print(f"   이미지 검색: {len(images)}개 발견")
-                print(f"   표 검색: {len(tables)}개 발견")
-                
-                # 첫 번째 페이지 요약
-                if stats['total_pages'] > 0:
-                    pages = agent.get_pages(doc_meta.doc_id)
-                    if pages:
-                        page_summary = await agent.get_page_summary(doc_meta.doc_id, pages[0].page_id)
-                        print(f"   첫 페이지 요소: {len(page_summary.get('elements', []))}개")
-                
-                # 멀티모달 검색 테스트
-                if api_key and stats.get('has_index'):
-                    search_results = agent.search_in_document(
-                        doc_meta.doc_id,
-                        "이미지",
-                        top_k=3
-                    )
-                    print(f"   멀티모달 검색 결과: {len(search_results)}개")
-                    
-                    for result in search_results[:2]:  # 처음 2개만 출력
-                        print(f"     - {result['element_type']}: {result['text'][:50]}...")
-                
-            except Exception as e:
-                print(f"❌ 파싱 실패: {str(e)}")
-                import traceback
-                traceback.print_exc()
-        else:
-            print(f"⏭️  테스트 파일 없음: {test_file}")
+    test_file = None
+    for file_name in test_files:
+        if Path(file_name).exists():
+            test_file = file_name
+            break
     
-    # 문서 목록 출력
-    docs = agent.list_documents()
-    print(f"\n📚 총 {len(docs)}개 멀티모달 문서 로드됨")
+    if not test_file:
+        print("❌ 테스트할 PDF 파일이 없습니다.")
+        print(f"   다음 파일 중 하나를 준비해주세요: {', '.join(test_files)}")
+        return
     
-    print("🎉 MultimodalDocumentAgent 테스트 완료!")
+    print(f"📄 테스트 파일: {test_file}")
+    
+    try:
+        #  DocumentAgent 생성
+        agent = DocumentAgent(
+            openai_api_key=api_key,
+            vision_model="gpt-5-nano",
+            embedding_model="text-embedding-3-small"
+        )
+        
+        print(f"📖  문서 처리 중: {test_file}")
+        doc_meta = await agent.process_document(test_file)
+        
+        print(f"✅ 문서 처리 완료!")
+        print(f"   문서 ID: {doc_meta.doc_id}")
+        print(f"   제목: {doc_meta.title}")
+        print(f"   슬라이드 수: {doc_meta.total_pages}")
+        
+        # 용어 딕셔너리 확인
+        term_dict = agent.get_term_dictionary(doc_meta.doc_id)
+        if term_dict:
+            print(f"\n📚 용어 딕셔너리:")
+            print(f"   심볼: {len(term_dict.symbols)}개")
+            print(f"   용어: {len(term_dict.terms)}개")
+            
+            # 상위 5개 심볼 출력
+            symbol_counts = [(symbol, len(defs)) for symbol, defs in term_dict.symbols.items()]
+            symbol_counts.sort(key=lambda x: x[1], reverse=True)
+            
+            if symbol_counts:
+                print(f"   주요 심볼:")
+                for symbol, count in symbol_counts[:5]:
+                    print(f"     {symbol}: {count}회 등장")
+            
+            # 상위 5개 용어 출력
+            term_counts = [(term, len(defs)) for term, defs in term_dict.terms.items()]
+            term_counts.sort(key=lambda x: x[1], reverse=True)
+            
+            if term_counts:
+                print(f"   주요 용어:")
+                for term, count in term_counts[:5]:
+                    print(f"     {term}: {count}회 등장")
+        
+        # 문서 통계
+        stats = agent.get_document_stats(doc_meta.doc_id)
+        print(f"\n📊 문서 통계:")
+        print(f"   캡션 생성률: {stats['caption_coverage']:.1%}")
+        print(f"   평균 캡션 길이: {stats['avg_caption_length']:.0f}자")
+        print(f"   총 이미지 크기: {stats['total_image_size_mb']:.1f}MB")
+        
+        if 'term_dictionary' in stats and stats['term_dictionary']:
+            td_stats = stats['term_dictionary']
+            print(f"   용어 통계:")
+            print(f"     총 심볼: {td_stats['total_symbols']}개")
+            print(f"     총 용어: {td_stats['total_terms']}개") 
+            print(f"     명시적 정의: {td_stats['explicit_definitions']}개")
+        
+        # 슬라이드별 컨텍스트 테스트
+        slides = agent.get_slide_data(doc_meta.doc_id)
+        if slides and len(slides) > 2:
+            # 3번째 슬라이드에서 용어 컨텍스트 테스트
+            test_slide = slides[2]
+            test_terms = {"θ", "η", "learning", "gradient"}  # 예시 용어들
+            
+            context = agent.get_slide_context(doc_meta.doc_id, test_slide["page_id"], test_terms)
+            if context:
+                print(f"\n🔍 {test_slide['page_id']} 컨텍스트 예시:")
+                for item, info in context.items():
+                    print(f"   {item} ({info['type']}):")
+                    for def_info in info['definitions'][:2]:  # 최대 2개만 출력
+                        print(f"     - {def_info['slide_id']}: {def_info['context'][:50]}...")
+        
+        # 용어 딕셔너리 내보내기
+        export_path = agent.export_term_dictionary(doc_meta.doc_id)
+        if export_path:
+            print(f"\n💾 용어 딕셔너리 내보내기: {export_path}")
+        
+        print("\n🎉  DocumentAgent 테스트 완료!")
+        
+    except Exception as e:
+        print(f"❌ 테스트 실패: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
-    asyncio.run(test_multimodal_agent())
+    asyncio.run(test_document_agent())

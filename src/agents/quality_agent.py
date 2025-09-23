@@ -1,20 +1,19 @@
 """
-EDU-Audit Multimodal Quality Agent
-오탈자, 문법, 표현 일관성 + 멀티모달 품질 검출 에이전트
+EDU-Audit Quality Agent - Simplified
+슬라이드 캡션 기반 교육 품질 검수 에이전트
 """
 
 import asyncio
 import logging
+import json
 import re
-from collections import defaultdict, Counter
-from typing import List, Dict, Set, Optional, Any
+from typing import List, Dict, Optional, Any
 from dataclasses import dataclass
 
-from llama_index.llms.openai import OpenAI
+from openai import AsyncOpenAI
 
 from src.core.models import (
-    DocumentMeta, PageInfo, PageElement, ElementType, Issue, IssueType, 
-    TextLocation, BoundingBox, ImageElement, TableElement, ChartElement,
+    DocumentMeta, Issue, IssueType, TextLocation,
     generate_issue_id
 )
 
@@ -22,1138 +21,1092 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class TypoPattern:
-    """오탈자 패턴 정의"""
-    pattern: str          # 정규식 패턴
-    correction: str       # 올바른 표현
-    confidence: float     # 신뢰도
-    description: str      # 설명
-
-
-@dataclass
-class ConsistencyRule:
-    """일관성 규칙 정의"""
-    terms: List[str]      # 동일 의미의 다른 표현들
-    preferred: str        # 권장 표현
-    description: str      # 설명
-    domain: str          # 적용 도메인
-
-
-@dataclass
-class ImageQualityRule:
-    """이미지 품질 규칙"""
-    min_width: int = 300
-    min_height: int = 200
-    max_file_size_mb: float = 5.0
-    required_dpi: int = 150
-    avoid_formats: List[str] = None
+class QualityConfig:
+    """품질 검수 설정"""
+    max_issues_per_slide: int = 3
+    confidence_threshold: float = 0.7
+    enable_vision_analysis: bool = False
+    issue_severity_filter: str = "medium"  # low, medium, high
+    
+    # 필터링할 이슈 타입들 (너무 사소한 것들)
+    exclude_minor_issues: List[str] = None
     
     def __post_init__(self):
-        if self.avoid_formats is None:
-            self.avoid_formats = ["bmp", "tiff"]
+        if self.exclude_minor_issues is None:
+            self.exclude_minor_issues = [
+                "missing_period",  # 문장 끝 마침표 없음
+                "whitespace_issues",  # 공백 문제
+                "minor_formatting"  # 사소한 형식 문제
+            ]
 
-
-@dataclass
-class TableQualityRule:
-    """표 품질 규칙"""
-    min_rows: int = 2
-    min_cols: int = 2
-    max_empty_cells_ratio: float = 0.3
-    require_headers: bool = True
-    consistent_column_count: bool = True
-
-
-@dataclass
-class ChartQualityRule:
-    """차트 품질 규칙"""
-    require_title: bool = True
-    require_axis_labels: bool = True
-    require_legend: bool = False
-    min_data_points: int = 2
-    readable_text_size: bool = True
-
-
-class MultimodalQualityAgent:
-    """멀티모달 문서 품질 검사 에이전트"""
+class QualityAgent:
+    """
+    교육자료 품질 검수 에이전트
+    DocumentAgent가 생성한 슬라이드 데이터를 기반으로 
+    실제 학습에 영향을 주는 중요한 품질 이슈만 선별하여 검출
+    """
     
     def __init__(
-        self, 
-        openai_api_key: Optional[str] = None, 
-        llm_model: str = "gpt-5-nano",
-        vision_model: str = "gpt-4-vision-preview",
-        enable_vision_analysis: bool = True
+        self,
+        openai_api_key: Optional[str] = None,
+        model: str = "gpt-4o",
+        vision_model: str = "gpt-4o",
+        config: Optional[QualityConfig] = None
     ):
         self.openai_api_key = openai_api_key
-        self.enable_vision_analysis = enable_vision_analysis and openai_api_key
+        if not openai_api_key:
+            raise ValueError("OpenAI API Key가 필요합니다.")
         
-        # LLM 초기화 (API 키가 있는 경우만)
-        self.llm = None
-        self.vision_llm = None
+        self.model = model
+        self.vision_model = vision_model
+        self.config = config or QualityConfig()
         
-        if openai_api_key:
-            self.llm = OpenAI(
-                model=llm_model,
-                temperature=0.1,
-                api_key=openai_api_key
-            )
-            
-            if self.enable_vision_analysis:
-                self.vision_llm = OpenAI(
-                    model=vision_model,
-                    temperature=0.1,
-                    api_key=openai_api_key
-                )
+        # OpenAI 클라이언트
+        self.client = AsyncOpenAI(api_key=openai_api_key)
         
-        # 기존 패턴과 규칙 로드
-        self._load_typo_patterns()
-        self._load_consistency_rules()
+        # 시스템 프롬프트 설정
+        self._setup_system_prompts()
         
-        # 멀티모달 품질 규칙 로드
-        self._load_multimodal_rules()
-        
-        logger.info("MultimodalQualityAgent 초기화 완료")
-        logger.info(f"  Vision 분석: {'활성화' if self.enable_vision_analysis else '비활성화'}")
+        logger.info(f"QualityAgent 초기화 완료")
+        logger.info(f"  Vision 모델: {vision_model} (필수 사용)")
+        logger.info(f"  슬라이드당 최대 이슈: {self.config.max_issues_per_slide}개")
+        logger.info(f"  심각도 필터: {self.config.issue_severity_filter}")
+
+    def _passes_severity_filter(self, severity: str) -> bool:
+        """심각도 필터 통과 확인"""
+        severity_levels = {"low": 1, "medium": 2, "high": 3}
+        filter_level = severity_levels.get(self.config.issue_severity_filter, 2)
+        issue_level = severity_levels.get(severity, 2)
+
+        return issue_level >= filter_level
     
-    def _load_typo_patterns(self):
-        """일반적인 오탈자 패턴 로드"""
-        self.typo_patterns = [
-            # 한국어 오탈자
-            TypoPattern(
-                pattern=r"알고리듬",
-                correction="알고리즘",
-                confidence=0.95,
-                description="알고리듬 → 알고리즘"
-            ),
-            TypoPattern(
-                pattern=r"데이타",
-                correction="데이터",
-                confidence=0.98,
-                description="데이타 → 데이터"
-            ),
-            TypoPattern(
-                pattern=r"컴퓨타",
-                correction="컴퓨터",
-                confidence=0.98,
-                description="컴퓨타 → 컴퓨터"
-            ),
-            TypoPattern(
-                pattern=r"앨고리즘",
-                correction="알고리즘",
-                confidence=0.90,
-                description="앨고리즘 → 알고리즘"
-            ),
-            
-            # 영어 오탈자
-            TypoPattern(
-                pattern=r"\bteh\b",
-                correction="the",
-                confidence=0.99,
-                description="teh → the"
-            ),
-            TypoPattern(
-                pattern=r"\baccomodate\b",
-                correction="accommodate",
-                confidence=0.95,
-                description="accomodate → accommodate"
-            ),
-            TypoPattern(
-                pattern=r"\brecieve\b",
-                correction="receive",
-                confidence=0.95,
-                description="recieve → receive"
-            ),
-        ]
+    def _setup_system_prompts(self):
+        """시스템 프롬프트 설정"""
+        self.system_prompt = """당신은 교육자료 품질 검수 전문가입니다.
+
+주어진 슬라이드 이미지와 캡션을 함께 분석하여 실제 학습에 방해가 될 수 있는 중요한 문제만 찾아내세요.
+
+**분석 우선순위:**
+1. 슬라이드 이미지 직접 분석 (메인 소스)
+2. 캡션 정보 참고 (보조 정보)
+
+**중요한 원칙:**
+1. 사소하고 trivial한 문제는 무시하세요
+2. 학습자의 이해에 실질적으로 영향을 주는 문제에 집중하세요
+3. 한 슬라이드당 최대 3개의 가장 중요한 문제만 선별하세요
+
+**검출 대상 이슈 유형:**
+- typo: 이미지 내 텍스트의 명백한 오탈자
+- grammar: 이미지 내 텍스트의 문법 오류
+- consistency: 용어나 표기법 불일치
+- fact: 명백한 사실 오류나 잘못된 정보
+- image_quality: 이미지 해상도, 선명도, 가독성 문제
+- content_clarity: 내용 전달의 명료성 문제
+- layout: 레이아웃이나 디자인으로 인한 이해 방해
+
+**중점 검사 항목:**
+1. 이미지 내 텍스트의 오탈자 및 문법 오류
+2. 다이어그램, 차트, 표의 정확성
+3. 텍스트 가독성 (크기, 대비, 배치)
+4. 정보의 논리적 일관성
+5. 시각적 요소의 교육적 효과
+
+**무시할 문제들:**
+- 단순 띄어쓰기, 문장 부호 누락
+- 사소한 표현 차이
+- 개인적 선호도 문제
+- 극히 경미한 형식 문제
+
+응답은 반드시 JSON 배열 형태로 해주세요:
+[
+    {
+        "issue_type": "typo|grammar|consistency|fact|image_quality|content_clarity|layout_",
+        "original_text": "문제가 있는 원본 텍스트 (이미지에서 발견된)",
+        "message": "구체적인 문제점 설명",
+        "suggestion": "수정 제안",
+        "severity": "high|medium|low",
+        "confidence": 0.0-1.0,
+        "location": "이미지 내 위치 설명 (예: 제목, 본문, 차트 라벨 등)"
+    }
+]
+
+문제가 없으면 빈 배열 []을 반환하세요."""
     
-    def _load_consistency_rules(self):
-        """용어 일관성 규칙 로드"""
-        self.consistency_rules = [
-            ConsistencyRule(
-                terms=["학습률", "러닝레이트", "러닝 레이트", "학습속도", "learning rate"],
-                preferred="학습률",
-                description="학습률 관련 용어 통일",
-                domain="machine_learning"
-            ),
-            ConsistencyRule(
-                terms=["딥러닝", "심층학습", "깊은학습", "deep learning"],
-                preferred="딥러닝",
-                description="딥러닝 관련 용어 통일",
-                domain="machine_learning"
-            ),
-            ConsistencyRule(
-                terms=["데이터셋", "데이터세트", "데이터 셋", "dataset"],
-                preferred="데이터셋",
-                description="데이터셋 관련 용어 통일",
-                domain="data_science"
-            ),
-            ConsistencyRule(
-                terms=["알고리즘", "알고리듬", "앨고리즘", "algorithm"],
-                preferred="알고리즘",
-                description="알고리즘 관련 용어 통일",
-                domain="computer_science"
-            ),
-            ConsistencyRule(
-                terms=["머신러닝", "기계학습", "머신 러닝", "machine learning"],
-                preferred="머신러닝",
-                description="머신러닝 관련 용어 통일",
-                domain="machine_learning"
-            ),
-        ]
-    
-    def _load_multimodal_rules(self):
-        """멀티모달 품질 규칙 로드"""
-        self.image_quality_rules = ImageQualityRule()
-        self.table_quality_rules = TableQualityRule()
-        self.chart_quality_rules = ChartQualityRule()
-    
-    async def check_document(self, doc_meta: DocumentMeta, pages: List[PageInfo]) -> List[Issue]:
+    async def analyze_document(self, document_agent, doc_id: str) -> List[Issue]:
         """
-        멀티모달 문서 전체 품질 검사
+        DocumentAgent에서 처리된 문서 전체의 품질 검수
         
         Args:
-            doc_meta: 문서 메타데이터
-            pages: 페이지 목록 (멀티모달 요소 포함)
+            document_agent: DocumentAgent 인스턴스
+            doc_id: 문서 ID
             
         Returns:
-            List[Issue]: 발견된 이슈들
+            List[Issue]: 발견된 품질 이슈들
         """
-        logger.info(f"멀티모달 문서 품질 검사 시작: {doc_meta.doc_id}")
+        logger.info(f"품질 검수 시작: {doc_id}")
+        
+        # DocumentAgent에서 슬라이드 데이터 가져오기
+        doc_meta = document_agent.get_document(doc_id)
+        slide_data_list = document_agent.get_slide_data(doc_id)
+        
+        if not doc_meta or not slide_data_list:
+            logger.warning(f"문서 데이터가 없습니다: {doc_id}")
+            return []
         
         all_issues = []
         
-        # 1. 기존 텍스트 기반 검사
-        text_issues = await self._check_text_quality(doc_meta, pages)
-        all_issues.extend(text_issues)
+        # 슬라이드별 분석
+        for slide_data in slide_data_list:
+            try:
+                logger.info(f"슬라이드 분석: {slide_data['page_id']}")
+                
+                slide_issues = await self._analyze_slide(slide_data, doc_meta)
+                all_issues.extend(slide_issues)
+                
+                # API 레이트 제한 고려
+                await asyncio.sleep(0.2)
+                
+            except Exception as e:
+                logger.error(f"슬라이드 분석 실패 {slide_data['page_id']}: {str(e)}")
+                continue
         
-        # 2. 이미지 품질 검사
-        image_issues = await self._check_image_quality(doc_meta, pages)
-        all_issues.extend(image_issues)
+        # 문서 레벨 일관성 검사
+        document_issues = await self._analyze_document_consistency(slide_data_list, doc_meta)
+        all_issues.extend(document_issues)
         
-        # 3. 표 품질 검사
-        table_issues = await self._check_table_quality(doc_meta, pages)
-        all_issues.extend(table_issues)
+        # 최종 필터링
+        filtered_issues = self._filter_issues(all_issues)
         
-        # 4. 차트 품질 검사
-        chart_issues = await self._check_chart_quality(doc_meta, pages)
-        all_issues.extend(chart_issues)
-        
-        # 5. 멀티모달 일관성 검사 (OCR 텍스트 포함)
-        multimodal_consistency_issues = await self._check_multimodal_consistency(doc_meta, pages)
-        all_issues.extend(multimodal_consistency_issues)
-        
-        logger.info(f"멀티모달 품질 검사 완료: {len(all_issues)}개 이슈 발견")
-        return all_issues
+        logger.info(f"품질 검수 완료: {len(filtered_issues)}/{len(all_issues)}개 이슈 선별")
+        return filtered_issues
     
-    async def _check_text_quality(self, doc_meta: DocumentMeta, pages: List[PageInfo]) -> List[Issue]:
-        """기존 텍스트 품질 검사"""
-        all_issues = []
+    async def _analyze_slide(self, slide_data: Dict[str, Any], doc_meta: DocumentMeta) -> List[Issue]:
+        """단일 슬라이드 품질 분석 - 이미지 + 캡션 통합 분석"""
         
-        # 1. 패턴 기반 오탈자 검사
-        typo_issues = await self._check_typos_pattern_based(doc_meta, pages)
-        all_issues.extend(typo_issues)
-        
-        # 2. 용어 일관성 검사
-        consistency_issues = await self._check_consistency(doc_meta, pages)
-        all_issues.extend(consistency_issues)
-        
-        # 3. LLM 기반 문법 검사
-        if self.llm:
-            grammar_issues = await self._check_grammar_llm(doc_meta, pages)
-            all_issues.extend(grammar_issues)
-        
-        return all_issues
-    
-    async def _check_image_quality(self, doc_meta: DocumentMeta, pages: List[PageInfo]) -> List[Issue]:
-        """이미지 품질 검사"""
-        issues = []
-        
-        for page in pages:
-            for element in page.elements:
-                if element.element_type != ElementType.IMAGE or not element.image_data:
-                    continue
-                
-                image_data = element.image_data
-                
-                # 1. 이미지 크기 검사
-                if (image_data.dimensions[0] < self.image_quality_rules.min_width or 
-                    image_data.dimensions[1] < self.image_quality_rules.min_height):
-                    
-                    issue = self._create_multimodal_issue(
-                        doc_meta, page, element,
-                        IssueType.IMAGE_QUALITY,
-                        f"이미지 해상도가 낮습니다 ({image_data.dimensions[0]}x{image_data.dimensions[1]})",
-                        f"최소 {self.image_quality_rules.min_width}x{self.image_quality_rules.min_height} 권장",
-                        0.8
-                    )
-                    issues.append(issue)
-                
-                # 2. 파일 크기 검사
-                size_mb = image_data.size_bytes / (1024 * 1024)
-                if size_mb > self.image_quality_rules.max_file_size_mb:
-                    issue = self._create_multimodal_issue(
-                        doc_meta, page, element,
-                        IssueType.IMAGE_QUALITY,
-                        f"이미지 파일 크기가 큽니다 ({size_mb:.1f}MB)",
-                        f"최대 {self.image_quality_rules.max_file_size_mb}MB 권장",
-                        0.7
-                    )
-                    issues.append(issue)
-                
-                # 3. 파일 형식 검사
-                if image_data.format.lower() in self.image_quality_rules.avoid_formats:
-                    issue = self._create_multimodal_issue(
-                        doc_meta, page, element,
-                        IssueType.IMAGE_QUALITY,
-                        f"권장하지 않는 이미지 형식입니다 ({image_data.format})",
-                        "JPG, PNG 형식 사용 권장",
-                        0.6
-                    )
-                    issues.append(issue)
-                
-                # 4. Vision LLM을 통한 품질 분석
-                if self.enable_vision_analysis and self.vision_llm:
-                    vision_issues = await self._analyze_image_quality_with_vision(
-                        doc_meta, page, element
-                    )
-                    issues.extend(vision_issues)
-        
-        logger.info(f"이미지 품질 검사: {len(issues)}개 발견")
-        return issues
-    
-    async def _check_table_quality(self, doc_meta: DocumentMeta, pages: List[PageInfo]) -> List[Issue]:
-        """표 품질 검사"""
-        issues = []
-        
-        for page in pages:
-            for element in page.elements:
-                if element.element_type != ElementType.TABLE or not element.table_data:
-                    continue
-                
-                table_data = element.table_data
-                
-                # 1. 최소 크기 검사
-                if (table_data.row_count < self.table_quality_rules.min_rows or 
-                    table_data.col_count < self.table_quality_rules.min_cols):
-                    
-                    issue = self._create_multimodal_issue(
-                        doc_meta, page, element,
-                        IssueType.TABLE_FORMAT,
-                        f"표 크기가 작습니다 ({table_data.row_count}x{table_data.col_count})",
-                        f"최소 {self.table_quality_rules.min_rows}x{self.table_quality_rules.min_cols} 권장",
-                        0.7
-                    )
-                    issues.append(issue)
-                
-                # 2. 헤더 존재 여부 검사
-                if self.table_quality_rules.require_headers and not table_data.has_headers:
-                    issue = self._create_multimodal_issue(
-                        doc_meta, page, element,
-                        IssueType.TABLE_FORMAT,
-                        "표에 헤더가 없습니다",
-                        "명확한 열 제목 추가 권장",
-                        0.8
-                    )
-                    issues.append(issue)
-                
-                # 3. 빈 셀 비율 검사
-                empty_cells = self._count_empty_cells(table_data)
-                total_cells = table_data.row_count * table_data.col_count
-                empty_ratio = empty_cells / total_cells if total_cells > 0 else 0
-                
-                if empty_ratio > self.table_quality_rules.max_empty_cells_ratio:
-                    issue = self._create_multimodal_issue(
-                        doc_meta, page, element,
-                        IssueType.TABLE_FORMAT,
-                        f"표에 빈 셀이 많습니다 ({empty_ratio:.1%})",
-                        "불필요한 빈 셀 제거 또는 데이터 보완 권장",
-                        0.6
-                    )
-                    issues.append(issue)
-                
-                # 4. 열 일관성 검사
-                if self.table_quality_rules.consistent_column_count:
-                    inconsistent_rows = self._check_column_consistency(table_data)
-                    if inconsistent_rows:
-                        issue = self._create_multimodal_issue(
-                            doc_meta, page, element,
-                            IssueType.TABLE_FORMAT,
-                            f"표의 열 개수가 일관되지 않습니다 ({len(inconsistent_rows)}개 행)",
-                            "모든 행의 열 개수 통일 권장",
-                            0.9
-                        )
-                        issues.append(issue)
-        
-        logger.info(f"표 품질 검사: {len(issues)}개 발견")
-        return issues
-    
-    async def _check_chart_quality(self, doc_meta: DocumentMeta, pages: List[PageInfo]) -> List[Issue]:
-        """차트 품질 검사"""
-        issues = []
-        
-        for page in pages:
-            for element in page.elements:
-                if element.element_type != ElementType.CHART or not element.chart_data:
-                    continue
-                
-                chart_data = element.chart_data
-                
-                # 1. 제목 존재 여부 검사
-                if self.chart_quality_rules.require_title and not chart_data.title:
-                    issue = self._create_multimodal_issue(
-                        doc_meta, page, element,
-                        IssueType.CHART_READABILITY,
-                        "차트에 제목이 없습니다",
-                        "차트 내용을 설명하는 제목 추가 권장",
-                        0.8
-                    )
-                    issues.append(issue)
-                
-                # 2. 축 라벨 검사
-                if (self.chart_quality_rules.require_axis_labels and 
-                    (not chart_data.x_label or not chart_data.y_label)):
-                    
-                    missing_labels = []
-                    if not chart_data.x_label:
-                        missing_labels.append("X축")
-                    if not chart_data.y_label:
-                        missing_labels.append("Y축")
-                    
-                    issue = self._create_multimodal_issue(
-                        doc_meta, page, element,
-                        IssueType.CHART_READABILITY,
-                        f"차트에 {', '.join(missing_labels)} 라벨이 없습니다",
-                        "축의 의미를 설명하는 라벨 추가 권장",
-                        0.7
-                    )
-                    issues.append(issue)
-                
-                # 3. 범례 검사
-                if (self.chart_quality_rules.require_legend and 
-                    not chart_data.legend):
-                    
-                    issue = self._create_multimodal_issue(
-                        doc_meta, page, element,
-                        IssueType.CHART_READABILITY,
-                        "차트에 범례가 없습니다",
-                        "데이터 시리즈 구분을 위한 범례 추가 권장",
-                        0.6
-                    )
-                    issues.append(issue)
-                
-                # 4. 데이터 포인트 수 검사
-                if len(chart_data.data_points) < self.chart_quality_rules.min_data_points:
-                    issue = self._create_multimodal_issue(
-                        doc_meta, page, element,
-                        IssueType.CHART_READABILITY,
-                        f"차트 데이터가 부족합니다 ({len(chart_data.data_points)}개)",
-                        f"최소 {self.chart_quality_rules.min_data_points}개 데이터 포인트 권장",
-                        0.7
-                    )
-                    issues.append(issue)
-                
-                # 5. Vision LLM을 통한 가독성 분석
-                if self.enable_vision_analysis and self.vision_llm:
-                    readability_issues = await self._analyze_chart_readability_with_vision(
-                        doc_meta, page, element
-                    )
-                    issues.extend(readability_issues)
-        
-        logger.info(f"차트 품질 검사: {len(issues)}개 발견")
-        return issues
-    
-    async def _check_multimodal_consistency(self, doc_meta: DocumentMeta, pages: List[PageInfo]) -> List[Issue]:
-        """멀티모달 요소간 일관성 검사 (OCR 텍스트 포함)"""
-        issues = []
-        
-        # 모든 텍스트 수집 (raw_text + OCR 텍스트)
-        all_texts = []
-        
-        for page in pages:
-            # 페이지 텍스트
-            if page.raw_text.strip():
-                all_texts.append(page.raw_text)
-            
-            # OCR 텍스트
-            for element in page.elements:
-                if (element.element_type == ElementType.IMAGE and 
-                    element.image_data and 
-                    element.image_data.ocr_text):
-                    all_texts.append(element.image_data.ocr_text)
-        
-        # 전체 텍스트에서 일관성 검사
-        full_text = "\n".join(all_texts)
-        
-        for rule in self.consistency_rules:
-            found_terms = self._find_terms_in_text(full_text, rule.terms)
-            
-            if len(found_terms) > 1:
-                # OCR 텍스트에서 발견된 불일치 용어에 대한 이슈 생성
-                for term, positions in found_terms.items():
-                    if term != rule.preferred:
-                        # OCR 텍스트에서 발견된 경우 특별 처리
-                        ocr_issue = self._find_ocr_inconsistency(
-                            doc_meta, pages, term, rule
-                        )
-                        if ocr_issue:
-                            issues.append(ocr_issue)
-        
-        logger.info(f"멀티모달 일관성 검사: {len(issues)}개 발견")
-        return issues
-    
-    def _create_multimodal_issue(
-        self, 
-        doc_meta: DocumentMeta, 
-        page: PageInfo, 
-        element: PageElement,
-        issue_type: IssueType,
-        message: str,
-        suggestion: str,
-        confidence: float
-    ) -> Issue:
-        """멀티모달 이슈 생성"""
-        
-        issue_id = generate_issue_id(
-            doc_meta.doc_id,
-            page.page_id,
-            element.bbox or BoundingBox(x=0, y=0, width=100, height=100),
-            issue_type
-        )
-        
-        return Issue(
-            issue_id=issue_id,
-            doc_id=doc_meta.doc_id,
-            page_id=page.page_id,
-            issue_type=issue_type,
-            text_location=None,  # 멀티모달 요소는 bbox 사용
-            bbox_location=element.bbox,
-            element_id=element.element_id,
-            original_text=self._get_element_description(element),
-            message=message,
-            suggestion=suggestion,
-            confidence=confidence,
-            confidence_level="high",  # Pydantic이 자동 계산
-            agent_name="multimodal_quality_agent"
-        )
-    
-    def _get_element_description(self, element: PageElement) -> str:
-        """요소 설명 텍스트 생성"""
-        if element.element_type == ElementType.IMAGE and element.image_data:
-            return element.image_data.description or f"이미지 ({element.image_data.format})"
-        elif element.element_type == ElementType.TABLE and element.table_data:
-            return f"표 ({element.table_data.row_count}x{element.table_data.col_count})"
-        elif element.element_type == ElementType.CHART and element.chart_data:
-            return f"{element.chart_data.chart_type} 차트"
-        else:
-            return f"{element.element_type.value} 요소"
-    
-    def _count_empty_cells(self, table_data: TableElement) -> int:
-        """표의 빈 셀 개수 계산"""
-        empty_count = 0
-        
-        for row in table_data.rows:
-            for cell in row:
-                if not cell or cell.strip() == "":
-                    empty_count += 1
-        
-        return empty_count
-    
-    def _check_column_consistency(self, table_data: TableElement) -> List[int]:
-        """표의 열 일관성 검사"""
-        inconsistent_rows = []
-        expected_cols = len(table_data.headers) if table_data.headers else None
-        
-        for i, row in enumerate(table_data.rows):
-            if expected_cols is None:
-                expected_cols = len(row)
-            elif len(row) != expected_cols:
-                inconsistent_rows.append(i)
-        
-        return inconsistent_rows
-    
-    def _find_ocr_inconsistency(
-        self, 
-        doc_meta: DocumentMeta, 
-        pages: List[PageInfo], 
-        term: str, 
-        rule: ConsistencyRule
-    ) -> Optional[Issue]:
-        """OCR 텍스트에서 용어 불일치 찾기"""
-        
-        for page in pages:
-            for element in page.elements:
-                if (element.element_type == ElementType.IMAGE and 
-                    element.image_data and 
-                    element.image_data.ocr_text and 
-                    term.lower() in element.image_data.ocr_text.lower()):
-                    
-                    return self._create_multimodal_issue(
-                        doc_meta, page, element,
-                        IssueType.CONSISTENCY,
-                        f"이미지 내 텍스트에서 용어 불일치: '{term}'",
-                        f"'{rule.preferred}' 용어로 통일 권장",
-                        0.8
-                    )
-        
-        return None
-    
-    async def _analyze_image_quality_with_vision(
-        self, 
-        doc_meta: DocumentMeta, 
-        page: PageInfo, 
-        element: PageElement
-    ) -> List[Issue]:
-        """Vision LLM을 통한 이미지 품질 분석"""
-        if not self.vision_llm or not element.image_data or not element.image_data.image_data:
+        # 이미지가 필수
+        if not slide_data.get("image_base64"):
+            logger.warning(f"슬라이드 {slide_data['page_id']}에 이미지가 없습니다")
             return []
         
         try:
-            prompt = """이 교육용 이미지의 품질을 분석해주세요.
-
-다음 관점에서 문제점이 있는지 확인해주세요:
-1. 텍스트 가독성 (흐릿함, 작은 글씨)
-2. 이미지 선명도 (픽셀화, 압축 품질)
-3. 색상 대비 (구분하기 어려운 색상)
-4. 전체적인 시각적 품질
-
-문제가 있으면 "문제발견: [구체적 문제]"로 시작해서 설명해주세요.
-문제가 없으면 "품질양호"라고 답해주세요."""
-
-            # 실제 Vision API 호출은 별도 구현 필요
-            response = await self._call_vision_api_for_quality(prompt, element.image_data.image_data)
+            # Vision LLM으로 이미지 + 캡션 통합 분석
+            issues_data = await self._analyze_slide_with_vision(slide_data)
             
-            if response and "문제발견:" in response:
-                issue = self._create_multimodal_issue(
-                    doc_meta, page, element,
-                    IssueType.IMAGE_QUALITY,
-                    f"Vision 분석: {response.split('문제발견:')[1].strip()}",
-                    "이미지 품질 개선 권장",
-                    0.7
-                )
-                return [issue]
-        
-        except Exception as e:
-            logger.warning(f"Vision 기반 이미지 품질 분석 실패: {str(e)}")
-        
-        return []
-    
-    async def _analyze_chart_readability_with_vision(
-        self, 
-        doc_meta: DocumentMeta, 
-        page: PageInfo, 
-        element: PageElement
-    ) -> List[Issue]:
-        """Vision LLM을 통한 차트 가독성 분석"""
-        # 차트는 보통 이미지 형태로도 존재하므로, 관련 이미지 요소 찾기
-        if not self.vision_llm:
-            return []
-        
-        # 차트와 관련된 이미지 요소 찾기 (같은 위치 또는 유사한 설명)
-        related_image = None
-        for other_element in [e for e in element.__dict__.get('page_elements', [])]:
-            if (other_element.element_type == ElementType.IMAGE and 
-                other_element.image_data and 
-                "차트" in (other_element.image_data.description or "")):
-                related_image = other_element
-                break
-        
-        if not related_image or not related_image.image_data.image_data:
-            return []
-        
-        try:
-            prompt = """이 차트의 가독성을 분석해주세요.
-
-다음 관점에서 문제점을 확인해주세요:
-1. 텍스트 크기 (너무 작거나 읽기 어려움)
-2. 색상 구분 (비슷한 색상으로 구분 어려움)
-3. 축 라벨과 제목의 명확성
-4. 범례의 위치와 가독성
-5. 전체적인 레이아웃
-
-문제가 있으면 "가독성문제: [구체적 문제]"로 시작해서 설명해주세요.
-문제가 없으면 "가독성양호"라고 답해주세요."""
-
-            response = await self._call_vision_api_for_quality(prompt, related_image.image_data.image_data)
+            # Issue 객체로 변환
+            issues = self._convert_to_issues(issues_data, slide_data, doc_meta)
             
-            if response and "가독성문제:" in response:
-                issue = self._create_multimodal_issue(
-                    doc_meta, page, element,
-                    IssueType.CHART_READABILITY,
-                    f"Vision 분석: {response.split('가독성문제:')[1].strip()}",
-                    "차트 가독성 개선 권장",
-                    0.7
-                )
-                return [issue]
-        
-        except Exception as e:
-            logger.warning(f"Vision 기반 차트 가독성 분석 실패: {str(e)}")
-        
-        return []
-    
-    async def _call_vision_api_for_quality(self, prompt: str, image_data: str) -> Optional[str]:
-        """Vision API 호출 (품질 분석용)"""
-        # 실제 구현에서는 OpenAI Vision API 호출
-        # 현재는 더미 응답
-        await asyncio.sleep(0.1)
-        return "품질양호"  # 또는 "문제발견: 텍스트가 흐릿함"
-    
-    # 기존 텍스트 품질 검사 메서드들 (그대로 유지)
-    async def _check_typos_pattern_based(self, doc_meta: DocumentMeta, pages: List[PageInfo]) -> List[Issue]:
-        """패턴 기반 오탈자 검사 - 멀티모달 텍스트 포함"""
-        issues = []
-        
-        for page in pages:
-            # 1. 페이지 raw_text 검사
-            text_issues = await self._check_text_patterns(doc_meta, page, page.raw_text, page.raw_text)
-            issues.extend(text_issues)
-            
-            # 2. OCR 텍스트 검사
-            for element in page.elements:
-                if (element.element_type == ElementType.IMAGE and 
-                    element.image_data and 
-                    element.image_data.ocr_text):
-                    
-                    ocr_issues = await self._check_text_patterns(
-                        doc_meta, page, element.image_data.ocr_text, 
-                        f"이미지 OCR: {element.image_data.ocr_text}"
-                    )
-                    # OCR 이슈는 element_id 포함
-                    for issue in ocr_issues:
-                        issue.element_id = element.element_id
-                        issue.message = f"[OCR] {issue.message}"
-                    issues.extend(ocr_issues)
-        
-        logger.info(f"패턴 기반 오탈자 (멀티모달): {len(issues)}개 발견")
-        return issues
-    
-    async def _check_text_patterns(self, doc_meta: DocumentMeta, page: PageInfo, text: str, display_text: str) -> List[Issue]:
-        """텍스트에서 패턴 기반 오탈자 검사"""
-        issues = []
-        
-        if not text.strip():
             return issues
-        
-        for pattern in self.typo_patterns:
-            matches = re.finditer(pattern.pattern, text, re.IGNORECASE)
             
-            for match in matches:
-                location = TextLocation(
-                    start=match.start(),
-                    end=match.end()
-                )
+        except Exception as e:
+            logger.error(f"슬라이드 분석 실패 {slide_data['page_id']}: {str(e)}")
+            return []
+    
+    async def _analyze_slide_with_vision(self, slide_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Vision 모델을 통한 슬라이드 이미지 + 캡션 통합 분석"""
+        
+        # 캡션 정보 준비
+        caption_info = ""
+        if slide_data.get("caption"):
+            caption_info += f"\n\n[AI 생성 캡션 (참고용)]\n{slide_data['caption']}"
+        
+        if slide_data.get("slide_text"):
+            caption_info += f"\n\n[슬라이드 원본 텍스트 (참고용)]\n{slide_data['slide_text']}"
+        
+        analysis_prompt = f"""이 교육자료 슬라이드를 면밀히 분석해주세요.
+
+**분석 방법:**
+1. 슬라이드 이미지를 직접 보고 분석하세요 (주요 소스)
+2. 아래 캡션 정보는 참고만 하세요 (보조 정보)
+
+**중점 검사 항목:**
+1. 이미지 내 모든 텍스트의 오탈자, 문법 오류
+2. 차트, 표, 다이어그램의 정확성
+3. 텍스트 가독성 (크기, 대비, 위치)
+4. 정보의 논리적 일관성
+5. 시각적 요소가 학습에 미치는 영향
+
+**특히 주의깊게 확인할 것:**
+- 제목, 헤딩의 오탈자
+- 본문 텍스트의 문법 오류
+- 차트나 표의 라벨, 수치 오류
+- 용어 사용의 일관성
+- 텍스트와 시각 요소 간의 불일치
+
+위의 시스템 지침에 따라 실제 학습에 방해가 될 수 있는 중요한 문제만 찾아서 JSON 배열로 반환해주세요.{caption_info}"""
+
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.vision_model,
+                messages=[
+                    {"role": "system", "content": self.system_prompt},
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": analysis_prompt
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{slide_data['image_base64']}",
+                                    "detail": "high"
+                                }
+                            }
+                        ]
+                    }
+                ],
+            )
+            
+            response_text = response.choices[0].message.content.strip()
+            
+            # JSON 파싱
+            if response_text.startswith("```json"):
+                response_text = response_text.split("```json")[1].split("```")[0].strip()
+            elif response_text.startswith("```"):
+                response_text = response_text.split("```")[1].split("```")[0].strip()
+            
+            issues_data = json.loads(response_text)
+            
+            # 이슈 개수 제한
+            if len(issues_data) > self.config.max_issues_per_slide:
+                # 심각도와 신뢰도 기준으로 상위 N개 선택
+                issues_data = sorted(
+                    issues_data, 
+                    key=lambda x: (
+                        x.get("severity", "medium") == "high",
+                        x.get("confidence", 0.5)
+                    ),
+                    reverse=True
+                )[:self.config.max_issues_per_slide]
+            
+            return issues_data
+            
+        except json.JSONDecodeError as e:
+            logger.warning(f"Vision LLM 응답 JSON 파싱 실패: {response_text[:100]}... - {str(e)}")
+            return []
+        except Exception as e:
+            logger.error(f"Vision 분석 실패: {str(e)}")
+            return []
+    
+    def _prepare_slide_text(self, slide_data: Dict[str, Any]) -> str:
+        """슬라이드 분석용 텍스트 준비"""
+        text_parts = []
+        
+        # 캡션 (주요 분석 대상)
+        if slide_data.get("caption"):
+            text_parts.append(f"[슬라이드 설명]\n{slide_data['caption']}")
+        
+        # 원본 슬라이드 텍스트 (있는 경우)
+        if slide_data.get("slide_text"):
+            text_parts.append(f"[슬라이드 원본 텍스트]\n{slide_data['slide_text']}")
+        
+        return "\n\n".join(text_parts)
+    
+    async def _request_llm_analysis(self, text: str) -> List[Dict[str, Any]]:
+        """LLM에 품질 분석 요청"""
+        
+        user_prompt = f"""다음 교육자료 슬라이드를 분석해주세요:
+
+{text}
+
+위의 시스템 지침에 따라 실제 학습에 방해가 될 수 있는 중요한 문제만 찾아서 JSON 배열로 반환해주세요."""
+
+        response = await self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+        )
+        
+        response_text = response.choices[0].message.content.strip()
+        
+        try:
+            # JSON 파싱
+            if response_text.startswith("```json"):
+                response_text = response_text.split("```json")[1].split("```")[0].strip()
+            elif response_text.startswith("```"):
+                response_text = response_text.split("```")[1].split("```")[0].strip()
+            
+            issues_data = json.loads(response_text)
+            
+            # 이슈 개수 제한
+            if len(issues_data) > self.config.max_issues_per_slide:
+                # 심각도와 신뢰도 기준으로 상위 N개 선택
+                issues_data = sorted(
+                    issues_data, 
+                    key=lambda x: (
+                        x.get("severity", "medium") == "high",
+                        x.get("confidence", 0.5)
+                    ),
+                    reverse=True
+                )[:self.config.max_issues_per_slide]
+            
+            return issues_data
+            
+        except json.JSONDecodeError as e:
+            logger.warning(f"LLM 응답 JSON 파싱 실패: {response_text[:100]}... - {str(e)}")
+            return []
+    
+    def _convert_to_issues(
+        self, 
+        issues_data: List[Dict[str, Any]], 
+        slide_data: Dict[str, Any], 
+        doc_meta: DocumentMeta
+    ) -> List[Issue]:
+        """Vision LLM 응답을 Issue 객체로 변환"""
+        
+        issues = []
+        
+        for issue_data in issues_data:
+            try:
+                # 필수 필드 확인
+                if not all(key in issue_data for key in ["issue_type", "message"]):
+                    logger.warning(f"이슈 데이터 필드 누락: {issue_data}")
+                    continue
                 
-                issue_id = generate_issue_id(
-                    doc_meta.doc_id,
-                    page.page_id,
-                    location,
-                    IssueType.TYPO
-                )
+                # IssueType 검증 (layout 추가 처리)
+                issue_type_str = issue_data["issue_type"]
+                if issue_type_str == "layout":
+                    issue_type_str = "image_quality"  # 기존 타입으로 매핑
                 
+                try:
+                    issue_type = IssueType(issue_type_str)
+                except ValueError:
+                    logger.warning(f"지원하지 않는 이슈 타입: {issue_data['issue_type']}")
+                    continue
+                
+                # 신뢰도 필터링
+                confidence = issue_data.get("confidence", 0.8)
+                if confidence < self.config.confidence_threshold:
+                    continue
+                
+                # 심각도 필터링
+                severity = issue_data.get("severity", "medium")
+                if not self._passes_severity_filter(severity):
+                    continue
+                
+                # 원본 텍스트와 위치 정보
+                original_text = issue_data.get("original_text", "")
+                location_desc = issue_data.get("location", "")
+                
+                # 이미지 기반 분석이므로 text_location은 None으로 설정
+                text_location = None
+                
+                # Issue 객체 생성
                 issue = Issue(
-                    issue_id=issue_id,
+                    issue_id=generate_issue_id(
+                        doc_meta.doc_id,
+                        slide_data["page_id"],
+                        TextLocation(start=0, end=1),  # 더미 위치
+                        issue_type
+                    ),
                     doc_id=doc_meta.doc_id,
-                    page_id=page.page_id,
-                    issue_type=IssueType.TYPO,
-                    text_location=location,
-                    original_text=match.group(),
-                    message=pattern.description,
-                    suggestion=pattern.correction,
-                    confidence=pattern.confidence,
-                    confidence_level="high",
-                    agent_name="multimodal_quality_agent"
+                    page_id=slide_data["page_id"],
+                    issue_type=issue_type,
+                    text_location=text_location,
+                    bbox_location=None,
+                    element_id=None,
+                    original_text=original_text,
+                    message=f"[{location_desc}] {issue_data['message']}" if location_desc else issue_data["message"],
+                    suggestion=issue_data.get("suggestion", ""),
+                    confidence=confidence,
+                    confidence_level="high",  # Pydantic이 자동 계산
+                    agent_name="quality_agent_vision"
                 )
                 
                 issues.append(issue)
+                
+            except Exception as e:
+                logger.warning(f"이슈 객체 생성 실패: {str(e)} - {issue_data}")
+                continue
         
         return issues
     
-    async def _check_consistency(self, doc_meta: DocumentMeta, pages: List[PageInfo]) -> List[Issue]:
-        """용어 일관성 검사 - 멀티모달 텍스트 포함"""
-        issues = []
+    def _find_text_location(self, slide_data: Dict[str, Any], original_text: str) -> Optional[TextLocation]:
+        """텍스트에서 원본 위치 찾기"""
+        if not original_text:
+            return None
         
-        # 모든 텍스트 수집 (페이지 텍스트 + OCR 텍스트)
-        all_texts = []
-        for page in pages:
-            all_texts.append(page.raw_text)
-            
-            # OCR 텍스트도 포함
-            for element in page.elements:
-                if (element.element_type == ElementType.IMAGE and 
-                    element.image_data and 
-                    element.image_data.ocr_text):
-                    all_texts.append(element.image_data.ocr_text)
+        # 캡션에서 찾기
+        caption = slide_data.get("caption", "")
+        if original_text in caption:
+            start = caption.find(original_text)
+            return TextLocation(start=start, end=start + len(original_text))
         
-        full_text = "\n".join(all_texts)
-        
-        for rule in self.consistency_rules:
-            found_terms = self._find_terms_in_text(full_text, rule.terms)
-            
-            if len(found_terms) > 1:
-                most_common = max(found_terms.items(), key=lambda x: len(x[1]))[0]
-                
-                for term, positions in found_terms.items():
-                    if term != rule.preferred and term != most_common:
-                        first_pos = positions[0]
-                        page_info = self._find_page_by_position(pages, first_pos)
-                        
-                        if page_info:
-                            page, relative_pos = page_info
-                            
-                            location = TextLocation(
-                                start=relative_pos,
-                                end=relative_pos + len(term)
-                            )
-                            
-                            issue_id = generate_issue_id(
-                                doc_meta.doc_id,
-                                page.page_id,
-                                location,
-                                IssueType.CONSISTENCY
-                            )
-                            
-                            issue = Issue(
-                                issue_id=issue_id,
-                                doc_id=doc_meta.doc_id,
-                                page_id=page.page_id,
-                                issue_type=IssueType.CONSISTENCY,
-                                text_location=location,
-                                original_text=term,
-                                message=f"용어 일관성: {rule.description}",
-                                suggestion=f"'{rule.preferred}' 용어로 통일 권장",
-                                confidence=0.85,
-                                confidence_level="medium",
-                                agent_name="multimodal_quality_agent"
-                            )
-                            
-                            issues.append(issue)
-        
-        logger.info(f"일관성 검사 (멀티모달): {len(issues)}개 발견")
-        return issues
-    
-    def _find_terms_in_text(self, text: str, terms: List[str]) -> Dict[str, List[int]]:
-        """텍스트에서 용어들의 위치 찾기"""
-        found = {}
-        text_lower = text.lower()
-        
-        for term in terms:
-            positions = []
-            term_lower = term.lower()
-            start = 0
-            
-            while True:
-                pos = text_lower.find(term_lower, start)
-                if pos == -1:
-                    break
-                
-                if self._is_word_boundary(text, pos, len(term)):
-                    positions.append(pos)
-                
-                start = pos + 1
-            
-            if positions:
-                found[term] = positions
-        
-        return found
-    
-    def _is_word_boundary(self, text: str, pos: int, length: int) -> bool:
-        """단어 경계인지 확인"""
-        before = text[pos-1] if pos > 0 else ' '
-        after = text[pos + length] if pos + length < len(text) else ' '
-        
-        return not (before.isalnum() or after.isalnum())
-    
-    def _find_page_by_position(self, pages: List[PageInfo], position: int) -> Optional[tuple[PageInfo, int]]:
-        """전체 텍스트 위치에서 페이지와 상대 위치 찾기"""
-        current_pos = 0
-        
-        for page in pages:
-            page_length = len(page.raw_text) + 1
-            
-            if current_pos <= position < current_pos + page_length:
-                relative_pos = position - current_pos
-                return page, relative_pos
-            
-            current_pos += page_length
+        # 원본 텍스트에서 찾기
+        slide_text = slide_data.get("slide_text", "")
+        if original_text in slide_text:
+            start = slide_text.find(original_text)
+            return TextLocation(start=start, end=start + len(original_text))
         
         return None
     
-    async def _check_grammar_llm(self, doc_meta: DocumentMeta, pages: List[PageInfo]) -> List[Issue]:
-        """LLM 기반 문법 검사 - 멀티모달 텍스트 포함"""
-        if not self.llm:
+    
+    async def _analyze_document_consistency(self, slide_data_list: List[Dict[str, Any]], doc_meta: DocumentMeta) -> List[Issue]:
+        """문서 전체 일관성 분석 - 캡션 기반"""
+        if len(slide_data_list) < 2:
             return []
         
-        issues = []
-        
-        for page in pages:
-            # 1. 페이지 텍스트 검사
-            if page.raw_text.strip() and len(page.raw_text) <= 1000:
-                korean_text = self._extract_korean_text(page.raw_text)
-                if len(korean_text) >= 20:
-                    try:
-                        page_issues = await self._check_grammar_for_text(
-                            doc_meta, page, korean_text, "페이지 텍스트"
-                        )
-                        issues.extend(page_issues)
-                    except Exception as e:
-                        logger.warning(f"페이지 문법 검사 실패: {str(e)}")
-            
-            # 2. OCR 텍스트 검사
-            for element in page.elements:
-                if (element.element_type == ElementType.IMAGE and 
-                    element.image_data and 
-                    element.image_data.ocr_text):
-                    
-                    korean_text = self._extract_korean_text(element.image_data.ocr_text)
-                    if len(korean_text) >= 20:
-                        try:
-                            ocr_issues = await self._check_grammar_for_text(
-                                doc_meta, page, korean_text, f"OCR 텍스트 ({element.element_id})"
-                            )
-                            # OCR 이슈는 element_id 포함
-                            for issue in ocr_issues:
-                                issue.element_id = element.element_id
-                                issue.message = f"[OCR] {issue.message}"
-                            issues.extend(ocr_issues)
-                        except Exception as e:
-                            logger.warning(f"OCR 문법 검사 실패: {str(e)}")
-        
-        logger.info(f"LLM 문법 검사 (멀티모달): {len(issues)}개 발견")
-        return issues
-    
-    async def _check_grammar_for_text(self, doc_meta: DocumentMeta, page: PageInfo, text: str, source: str) -> List[Issue]:
-        """특정 텍스트에 대한 문법 검사"""
         try:
-            prompt = self._create_grammar_check_prompt(text)
-            response = await self.llm.acomplete(prompt)
+            # 모든 캡션 결합 (이미지 분석은 개별 슬라이드에서 수행)
+            all_captions = []
+            for slide in slide_data_list:
+                if slide.get("caption"):
+                    all_captions.append(f"슬라이드 {slide['page_number']}: {slide['caption']}")
             
-            page_issues = self._parse_grammar_response(response.text, doc_meta, page)
+            if len(all_captions) < 2:
+                return []
             
-            # API 호출 제한
-            await asyncio.sleep(0.5)
+            combined_text = "\n\n".join(all_captions)
             
-            return page_issues
+            consistency_prompt = f"""다음은 교육자료의 모든 슬라이드 AI 생성 캡션입니다:
+
+{combined_text}
+
+문서 전체에서 다음 일관성 문제를 찾아주세요:
+1. 동일한 개념에 대한 다른 용어 사용 (예: "머신러닝" vs "기계학습")
+2. 설명 스타일의 심각한 불일치
+3. 논리적 순서나 구조의 문제
+4. 전체적인 교육 흐름의 문제
+
+중요한 일관성 문제만 JSON 배열로 반환해주세요:
+[{{"issue_type": "consistency", "message": "...", "suggestion": "...", "affected_slides": [1, 2, 3], "confidence": 0.0-1.0}}]
+
+문제가 없으면 빈 배열 []을 반환하세요."""
+
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "당신은 교육자료 일관성 검수 전문가입니다."},
+                    {"role": "user", "content": consistency_prompt}
+                ],
+            )
+            
+            response_text = response.choices[0].message.content.strip()
+            
+            # JSON 파싱
+            if response_text.startswith("```json"):
+                response_text = response_text.split("```json")[1].split("```")[0].strip()
+            elif response_text.startswith("```"):
+                response_text = response_text.split("```")[1].split("```")[0].strip()
+            
+            consistency_data = json.loads(response_text)
+            
+            # 문서 레벨 이슈로 변환
+            document_issues = []
+            for issue_data in consistency_data:
+                if issue_data.get("confidence", 0.8) >= self.config.confidence_threshold:
+                    # 첫 번째 슬라이드에 이슈 할당
+                    first_slide = slide_data_list[0]
+                    
+                    issue = Issue(
+                        issue_id=generate_issue_id(
+                            doc_meta.doc_id,
+                            first_slide["page_id"],
+                            TextLocation(start=0, end=1),
+                            IssueType.CONSISTENCY
+                        ),
+                        doc_id=doc_meta.doc_id,
+                        page_id=first_slide["page_id"],
+                        issue_type=IssueType.CONSISTENCY,
+                        text_location=None,
+                        bbox_location=None,
+                        element_id=None,
+                        original_text="문서 전체",
+                        message=f"[문서 일관성] {issue_data['message']}",
+                        suggestion=issue_data.get("suggestion", ""),
+                        confidence=issue_data.get("confidence", 0.8),
+                        confidence_level="medium",
+                        agent_name="quality_agent_consistency"
+                    )
+                    
+                    document_issues.append(issue)
+            
+            return document_issues
             
         except Exception as e:
-            logger.warning(f"{source} 문법 검사 실패: {str(e)}")
+            logger.warning(f"문서 일관성 분석 실패: {str(e)}")
             return []
     
-    def _extract_korean_text(self, text: str) -> str:
-        """텍스트에서 한국어 부분만 추출"""
-        sentences = re.split(r'[.!?]\s*', text)
-        korean_sentences = []
+    def _filter_issues(self, issues: List[Issue]) -> List[Issue]:
+        """최종 이슈 필터링"""
+        filtered = []
         
-        for sentence in sentences:
-            if re.search(r'[가-힣]', sentence) and len(sentence.strip()) > 5:
-                korean_sentences.append(sentence.strip())
+        for issue in issues:
+            # 신뢰도 필터
+            if issue.confidence < self.config.confidence_threshold:
+                continue
+            
+            # 중복 제거 (같은 페이지, 같은 타입, 비슷한 메시지)
+            is_duplicate = False
+            for existing in filtered:
+                if (existing.page_id == issue.page_id and 
+                    existing.issue_type == issue.issue_type and
+                    self._similar_messages(existing.message, issue.message)):
+                    is_duplicate = True
+                    break
+            
+            if not is_duplicate:
+                filtered.append(issue)
         
-        return ' '.join(korean_sentences)
+        # 심각도 기준 정렬
+        filtered.sort(key=lambda x: (
+            x.issue_type == IssueType.FACT,  # 사실 오류 우선
+            x.confidence
+        ), reverse=True)
+        
+        return filtered
     
-    def _create_grammar_check_prompt(self, text: str) -> str:
-        """문법 검사용 프롬프트 생성"""
-        return f"""다음 한국어 텍스트의 문법과 맞춤법을 검사해주세요.
-
-텍스트: {text}
-
-다음 형식으로 간단히 응답해주세요:
-- 문제가 있으면: "오류발견: [문제있는부분] -> [수정제안]"
-- 문제가 없으면: "문제없음"
-
-여러 오류가 있다면 각각 한 줄씩 작성해주세요."""
+    def _similar_messages(self, msg1: str, msg2: str, threshold: float = 0.8) -> bool:
+        """메시지 유사도 확인 (간단한 문자열 비교)"""
+        if not msg1 or not msg2:
+            return False
+        
+        # 간단한 Jaccard 유사도
+        words1 = set(msg1.lower().split())
+        words2 = set(msg2.lower().split())
+        
+        if not words1 or not words2:
+            return False
+        
+        intersection = len(words1 & words2)
+        union = len(words1 | words2)
+        
+        return (intersection / union) > threshold
     
-    def _parse_grammar_response(self, response: str, doc_meta: DocumentMeta, page: PageInfo) -> List[Issue]:
-        """LLM 응답에서 문법 이슈 파싱"""
-        issues = []
+    def get_quality_summary(self, issues: List[Issue]) -> Dict[str, Any]:
+        """품질 검수 결과 요약"""
+        if not issues:
+            return {
+                "total_issues": 0,
+                "quality_score": 1.0,
+                "by_type": {},
+                "by_severity": {},
+                "recommendations": ["문서 품질이 우수합니다."]
+            }
         
-        if "문제없음" in response or "오류발견" not in response:
-            return issues
+        # 타입별 분류
+        by_type = {}
+        by_severity = {"high": 0, "medium": 0, "low": 0}
         
-        lines = response.strip().split('\n')
+        for issue in issues:
+            issue_type = issue.issue_type.value
+            by_type[issue_type] = by_type.get(issue_type, 0) + 1
+            
+            if issue.confidence >= 0.9:
+                by_severity["high"] += 1
+            elif issue.confidence >= 0.7:
+                by_severity["medium"] += 1
+            else:
+                by_severity["low"] += 1
         
-        for line in lines:
-            if "오류발견:" in line:
-                try:
-                    parts = line.split("오류발견:")[1].strip()
-                    if "->" in parts:
-                        original, suggestion = parts.split("->", 1)
-                        original = original.strip()
-                        suggestion = suggestion.strip()
-                        
-                        pos = page.raw_text.find(original)
-                        if pos != -1:
-                            location = TextLocation(
-                                start=pos,
-                                end=pos + len(original)
-                            )
-                            
-                            issue_id = generate_issue_id(
-                                doc_meta.doc_id,
-                                page.page_id,
-                                location,
-                                IssueType.GRAMMAR
-                            )
-                            
-                            issue = Issue(
-                                issue_id=issue_id,
-                                doc_id=doc_meta.doc_id,
-                                page_id=page.page_id,
-                                issue_type=IssueType.GRAMMAR,
-                                text_location=location,
-                                original_text=original,
-                                message="LLM이 감지한 문법/맞춤법 오류",
-                                suggestion=suggestion,
-                                confidence=0.75,
-                                confidence_level="medium",
-                                agent_name="multimodal_quality_agent"
-                            )
-                            
-                            issues.append(issue)
-                
-                except Exception as e:
-                    logger.warning(f"문법 응답 파싱 실패: {str(e)}")
+        # 품질 점수 계산 (0.0 ~ 1.0)
+        quality_score = max(0.0, 1.0 - (len(issues) * 0.1))
         
-        return issues
+        # 권장사항 생성
+        recommendations = []
+        if by_type.get("fact", 0) > 0:
+            recommendations.append("사실 확인이 필요한 내용이 있습니다.")
+        if by_type.get("typo", 0) > 0:
+            recommendations.append("오탈자 교정이 필요합니다.")
+        if by_type.get("consistency", 0) > 0:
+            recommendations.append("용어 사용의 일관성을 확인해주세요.")
+        if by_type.get("image_quality", 0) > 0:
+            recommendations.append("이미지 품질 개선을 고려해주세요.")
+        
+        return {
+            "total_issues": len(issues),
+            "quality_score": quality_score,
+            "by_type": by_type,
+            "by_severity": by_severity,
+            "recommendations": recommendations
+        }
+    async def _analyze_slide_vision(self, slide_data: Dict[str, Any], doc_meta: DocumentMeta) -> List[Issue]:
+        """Vision 모델을 통한 슬라이드 이미지 품질 분석"""
+        if not slide_data.get("image_base64"):
+            return []
+        
+        try:
+            vision_prompt = """이 교육자료 슬라이드의 시각적 품질을 분석해주세요.
+
+다음 관점에서 학습에 방해가 될 수 있는 문제만 찾아주세요:
+1. 텍스트 가독성 (너무 작거나 흐린 글씨)
+2. 이미지 품질 (해상도, 선명도)
+3. 색상 대비 (구분 어려운 색상)
+4. 레이아웃 (정보 전달에 방해되는 배치)
+
+중요한 문제만 JSON 배열로 반환해주세요:
+[{"issue_type": "image_quality", "message": "...", "suggestion": "...", "confidence": 0.0-1.0}]
+
+문제가 없으면 빈 배열 []을 반환하세요."""
+
+            response = await self.client.chat.completions.create(
+                model=self.vision_model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": vision_prompt
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{slide_data['image_base64']}",
+                                    "detail": "high"
+                                }
+                            }
+                        ]
+                    }
+                ],
+            )
+            
+            response_text = response.choices[0].message.content.strip()
+            
+            # JSON 파싱 및 Issue 변환
+            if response_text.startswith("```json"):
+                response_text = response_text.split("```json")[1].split("```")[0].strip()
+            elif response_text.startswith("```"):
+                response_text = response_text.split("```")[1].split("```")[0].strip()
+            
+            vision_issues_data = json.loads(response_text)
+            vision_issues = self._convert_to_issues(vision_issues_data, slide_data, doc_meta)
+            
+            return vision_issues
+            
+        except Exception as e:
+            logger.warning(f"Vision 분석 실패: {str(e)}")
+            return []
+    
+    async def _analyze_document_consistency(self, slide_data_list: List[Dict[str, Any]], doc_meta: DocumentMeta) -> List[Issue]:
+        """문서 전체 일관성 분석"""
+        if len(slide_data_list) < 2:
+            return []
+        
+        try:
+            # 모든 캡션 결합
+            all_captions = []
+            for slide in slide_data_list:
+                if slide.get("caption"):
+                    all_captions.append(f"슬라이드 {slide['page_number']}: {slide['caption']}")
+            
+            if len(all_captions) < 2:
+                return []
+            
+            combined_text = "\n\n".join(all_captions)
+            
+            consistency_prompt = f"""다음은 교육자료의 모든 슬라이드 설명입니다:
+
+{combined_text}
+
+문서 전체에서 다음 일관성 문제를 찾아주세요:
+1. 동일한 개념에 대한 다른 용어 사용 (예: "머신러닝" vs "기계학습")
+2. 설명 스타일의 심각한 불일치
+3. 논리적 순서나 구조의 문제
+
+중요한 일관성 문제만 JSON 배열로 반환해주세요:
+[{"issue_type": "consistency", "message": "...", "suggestion": "...", "affected_slides": [1, 2, 3]}]
+
+문제가 없으면 빈 배열 []을 반환하세요."""
+
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "당신은 교육자료 일관성 검수 전문가입니다."},
+                    {"role": "user", "content": consistency_prompt}
+                ],
+            )
+            
+            response_text = response.choices[0].message.content.strip()
+            
+            # JSON 파싱
+            if response_text.startswith("```json"):
+                response_text = response_text.split("```json")[1].split("```")[0].strip()
+            elif response_text.startswith("```"):
+                response_text = response_text.split("```")[1].split("```")[0].strip()
+            
+            consistency_data = json.loads(response_text)
+            
+            # 문서 레벨 이슈로 변환
+            document_issues = []
+            for issue_data in consistency_data:
+                if issue_data.get("confidence", 0.8) >= self.config.confidence_threshold:
+                    # 첫 번째 슬라이드에 이슈 할당
+                    first_slide = slide_data_list[0]
+                    
+                    issue = Issue(
+                        issue_id=generate_issue_id(
+                            doc_meta.doc_id,
+                            first_slide["page_id"],
+                            TextLocation(start=0, end=1),
+                            IssueType.CONSISTENCY
+                        ),
+                        doc_id=doc_meta.doc_id,
+                        page_id=first_slide["page_id"],
+                        issue_type=IssueType.CONSISTENCY,
+                        text_location=None,
+                        bbox_location=None,
+                        element_id=None,
+                        original_text="문서 전체",
+                        message=f"[문서 일관성] {issue_data['message']}",
+                        suggestion=issue_data.get("suggestion", ""),
+                        confidence=issue_data.get("confidence", 0.8),
+                        confidence_level="medium",
+                        agent_name="quality_agent"
+                    )
+                    
+                    document_issues.append(issue)
+            
+            return document_issues
+            
+        except Exception as e:
+            logger.warning(f"문서 일관성 분석 실패: {str(e)}")
+            return []
+    
+    def _filter_issues(self, issues: List[Issue]) -> List[Issue]:
+        """최종 이슈 필터링"""
+        filtered = []
+        
+        for issue in issues:
+            # 신뢰도 필터
+            if issue.confidence < self.config.confidence_threshold:
+                continue
+            
+            # 중복 제거 (같은 페이지, 같은 타입, 비슷한 메시지)
+            is_duplicate = False
+            for existing in filtered:
+                if (existing.page_id == issue.page_id and 
+                    existing.issue_type == issue.issue_type and
+                    self._similar_messages(existing.message, issue.message)):
+                    is_duplicate = True
+                    break
+            
+            if not is_duplicate:
+                filtered.append(issue)
+        
+        # 심각도 기준 정렬
+        filtered.sort(key=lambda x: (
+            x.issue_type == IssueType.FACT,  # 사실 오류 우선
+            x.confidence
+        ), reverse=True)
+        
+        return filtered
+    
+    def _similar_messages(self, msg1: str, msg2: str, threshold: float = 0.8) -> bool:
+        """메시지 유사도 확인 (간단한 문자열 비교)"""
+        if not msg1 or not msg2:
+            return False
+        
+        # 간단한 Jaccard 유사도
+        words1 = set(msg1.lower().split())
+        words2 = set(msg2.lower().split())
+        
+        if not words1 or not words2:
+            return False
+        
+        intersection = len(words1 & words2)
+        union = len(words1 | words2)
+        
+        return (intersection / union) > threshold
+    
+    def get_quality_summary(self, issues: List[Issue]) -> Dict[str, Any]:
+        """품질 검수 결과 요약"""
+        if not issues:
+            return {
+                "total_issues": 0,
+                "quality_score": 1.0,
+                "by_type": {},
+                "by_severity": {},
+                "recommendations": ["문서 품질이 우수합니다."]
+            }
+        
+        # 타입별 분류
+        by_type = {}
+        by_severity = {"high": 0, "medium": 0, "low": 0}
+        
+        for issue in issues:
+            issue_type = issue.issue_type.value
+            by_type[issue_type] = by_type.get(issue_type, 0) + 1
+            
+            if issue.confidence >= 0.9:
+                by_severity["high"] += 1
+            elif issue.confidence >= 0.7:
+                by_severity["medium"] += 1
+            else:
+                by_severity["low"] += 1
+        
+        # 품질 점수 계산 (0.0 ~ 1.0)
+        quality_score = max(0.0, 1.0 - (len(issues) * 0.1))
+        
+        # 권장사항 생성
+        recommendations = []
+        if by_type.get("fact", 0) > 0:
+            recommendations.append("사실 확인이 필요한 내용이 있습니다.")
+        if by_type.get("typo", 0) > 0:
+            recommendations.append("오탈자 교정이 필요합니다.")
+        if by_type.get("consistency", 0) > 0:
+            recommendations.append("용어 사용의 일관성을 확인해주세요.")
+        if by_type.get("image_quality", 0) > 0:
+            recommendations.append("이미지 품질 개선을 고려해주세요.")
+        
+        return {
+            "total_issues": len(issues),
+            "quality_score": quality_score,
+            "by_type": by_type,
+            "by_severity": by_severity,
+            "recommendations": recommendations
+        }
 
 
 # 테스트 함수
-async def test_multimodal_quality_agent():
-    """MultimodalQualityAgent 테스트"""
-    print("🧪 MultimodalQualityAgent 테스트 시작...")
+async def test_quality_agent():
+    """QualityAgent 테스트"""
+    print("🧪 QualityAgent 테스트 시작...")
     
     import os
     from dotenv import load_dotenv
     from pathlib import Path
+    
     env_path = Path(__file__).resolve().parents[2] / '.env.dev'
     load_dotenv(env_path)
     api_key = os.getenv("OPENAI_API_KEY")
     
+    if not api_key:
+        print("❌ OPENAI_API_KEY 환경변수가 설정되지 않았습니다.")
+        return
+    
+    # 설정
+    config = QualityConfig(
+        max_issues_per_slide=2,
+        confidence_threshold=0.7,
+        enable_vision_analysis=False,  # 테스트에서는 비활성화
+        issue_severity_filter="medium"
+    )
+    
     # 에이전트 생성
-    agent = MultimodalQualityAgent(
+    agent = QualityAgent(
         openai_api_key=api_key,
-        enable_vision_analysis=bool(api_key)
+        model="gpt-4o",
+        config=config
     )
     
-    # 테스트용 멀티모달 문서 생성
-    from src.core.models import (
-        DocumentMeta, PageInfo, PageElement, ElementType,
-        ImageElement, TableElement, BoundingBox, generate_doc_id
-    )
-    
-    # 문서 메타데이터
-    doc_meta = DocumentMeta(
-        doc_id=generate_doc_id("test_multimodal.pdf"),
-        title="멀티모달 테스트 문서",
-        doc_type="pdf",
-        total_pages=1,
-        file_path="test_multimodal.pdf"
-    )
-    
-    # 테스트 페이지 생성
-    test_elements = []
-    
-    # 1. 텍스트 요소 (오탈자 포함)
-    text_element = PageElement(
-        element_id="p001_text_001",
-        element_type=ElementType.TEXT,
-        text_content="딥러닝과 심층학습을 사용한 알고리듬 연구입니다. 데이타 전처리가 중요합니다.",
-        confidence=1.0
-    )
-    test_elements.append(text_element)
-    
-    # 2. 이미지 요소 (OCR 텍스트에 오탈자 포함)
-    image_element = PageElement(
-        element_id="p001_image_001",
-        element_type=ElementType.IMAGE,
-        bbox=BoundingBox(x=100, y=200, width=200, height=150),  # 작은 크기
-        image_data=ImageElement(
-            element_id="p001_image_001",
-            bbox=BoundingBox(x=100, y=200, width=200, height=150),
-            format="bmp",  # 권장하지 않는 형식
-            size_bytes=8 * 1024 * 1024,  # 8MB (큰 파일)
-            dimensions=(200, 150),  # 작은 해상도
-            ocr_text="머신러닝과 기계학습은 동일한 개념입니다",  # 용어 불일치
-            description="신경망 구조 다이어그램"
-        ),
-        confidence=0.8
-    )
-    test_elements.append(image_element)
-    
-    # 3. 표 요소 (품질 문제 포함)
-    table_element = PageElement(
-        element_id="p001_table_001",
-        element_type=ElementType.TABLE,
-        bbox=BoundingBox(x=50, y=400, width=400, height=100),
-        table_data=TableElement(
-            element_id="p001_table_001",
-            headers=[],  # 헤더 없음
-            rows=[
-                ["", "0.95", "빠름"],  # 빈 셀 포함
-                ["Random Forest", "", "중간"],  # 빈 셀 포함
-                ["Neural Network", "0.97"]  # 열 개수 불일치
+    # 테스트용 DocumentAgent 모의 객체
+    class MockDocumentAgent:
+        def get_document(self, doc_id):
+            from src.core.models import DocumentMeta
+            return DocumentMeta(
+                doc_id=doc_id,
+                title="테스트 교육자료",
+                doc_type="pdf",
+                total_pages=3,
+                file_path="test.pdf"
+            )
+        
+        def get_slide_data(self, doc_id):
+            return [
+                {
+                    "doc_id": doc_id,
+                    "page_id": "p001",
+                    "page_number": 1,
+                    "caption": "딥러닝과 심층학습을 사용한 알고리듬 연구입니다. 데이타 전처리가 중요합니다.",
+                    "slide_text": "머신 러닝 개요\n- 알고리듬의 종류\n- 데이타 분석 방법",
+                    "dimensions": (1920, 1080),
+                    "size_bytes": 123456
+                },
+                {
+                    "doc_id": doc_id,
+                    "page_id": "p002", 
+                    "page_number": 2,
+                    "caption": "기계학습의 핵심은 패턴 인식입니다. 충분한 학습 데이터가 있어야 합니다.",
+                    "slide_text": "패턴 인식\n- 지도 학습\n- 비지도 학습",
+                    "dimensions": (1920, 1080),
+                    "size_bytes": 98765
+                },
+                {
+                    "doc_id": doc_id,
+                    "page_id": "p003",
+                    "page_number": 3,
+                    "caption": "신경망은 뇌의 구조를 모방한 알고리즘입니다. 역전파를 통해 학습합니다.",
+                    "slide_text": "신경망 구조\n- 입력층\n- 은닉층\n- 출력층",
+                    "dimensions": (1920, 1080),
+                    "size_bytes": 87654
+                }
             ]
-        ),
-        confidence=0.9
-    )
-    test_elements.append(table_element)
     
-    # 4. 차트 요소 (가독성 문제 포함)
-    chart_element = PageElement(
-        element_id="p001_chart_001",
-        element_type=ElementType.CHART,
-        bbox=BoundingBox(x=50, y=550, width=400, height=200),
-        chart_data=ChartElement(
-            element_id="p001_chart_001",
-            chart_type="bar",
-            title="",  # 제목 없음
-            x_label="",  # X축 라벨 없음
-            y_label="",  # Y축 라벨 없음
-            data_points=[{"x": 1, "y": 0.95}],  # 데이터 포인트 부족
-            legend=[]  # 범례 없음
-        ),
-        confidence=0.7
-    )
-    test_elements.append(chart_element)
+    mock_doc_agent = MockDocumentAgent()
+    test_doc_id = "test_doc_001"
     
-    # 페이지 생성
-    test_page = PageInfo(
-        page_id="p001",
-        page_number=1,
-        raw_text="딥러닝과 심층학습을 사용한 알고리듬 연구입니다. 데이타 전처리가 중요합니다.",
-        word_count=12,
-        elements=test_elements
-    )
-    
-    # 멀티모달 품질 검사 실행
-    print("\n🔍 멀티모달 품질 검사 실행 중...")
-    issues = await agent.check_document(doc_meta, [test_page])
+    # 품질 검수 실행
+    print("\n🔍 품질 검수 실행 중...")
+    issues = await agent.analyze_document(mock_doc_agent, test_doc_id)
     
     print(f"\n📋 발견된 이슈들 ({len(issues)}개):")
     
-    # 이슈 타입별 분류
-    issue_by_type = {}
-    for issue in issues:
-        issue_type = issue.issue_type.value
-        if issue_type not in issue_by_type:
-            issue_by_type[issue_type] = []
-        issue_by_type[issue_type].append(issue)
+    # 이슈 출력
+    for i, issue in enumerate(issues, 1):
+        print(f"\n{i}. [{issue.issue_type.value.upper()}] {issue.page_id}")
+        print(f"   원본: {issue.original_text}")
+        print(f"   문제: {issue.message}")
+        print(f"   제안: {issue.suggestion}")
+        print(f"   신뢰도: {issue.confidence:.2f}")
     
-    for issue_type, type_issues in issue_by_type.items():
-        print(f"\n📌 {issue_type.upper()} ({len(type_issues)}개)")
+    # 품질 요약
+    summary = agent.get_quality_summary(issues)
+    print(f"\n📊 품질 요약:")
+    print(f"   전체 이슈: {summary['total_issues']}개")
+    print(f"   품질 점수: {summary['quality_score']:.2f}/1.0")
+    
+    print(f"\n📈 이슈 유형별 분포:")
+    for issue_type, count in summary['by_type'].items():
+        print(f"   {issue_type}: {count}개")
+    
+    print(f"\n🎯 권장사항:")
+    for rec in summary['recommendations']:
+        print(f"   - {rec}")
+    
+    print("\n🎉 QualityAgent 테스트 완료!")
+
+async def test_quality_agent_e2e():
+    """QualityAgent E2E 테스트 - DocumentAgent와 연동"""
+    print("🧪 QualityAgent E2E 테스트 시작...")
+    
+    import os
+    from dotenv import load_dotenv
+    from pathlib import Path
+    
+    env_path = Path(__file__).resolve().parents[2] / '.env.dev'
+    load_dotenv(env_path)
+    api_key = os.getenv("OPENAI_API_KEY")
+    
+    if not api_key:
+        print("❌ OPENAI_API_KEY 환경변수가 설정되지 않았습니다.")
+        return
+    
+    # 테스트할 파일 찾기
+    test_files = [
+        "sample_docs/sample.pdf"
+    ]
+    
+    test_file = None
+    for file_name in test_files:
+        if Path(file_name).exists():
+            test_file = file_name
+            break
+    
+    if not test_file:
+        print("❌ 테스트할 PDF 파일이 없습니다.")
+        print(f"   다음 파일 중 하나를 준비해주세요: {', '.join(test_files)}")
+        return
+    
+    print(f"📄 테스트 파일: {test_file}")
+    
+    try:
+        # 1. DocumentAgent 초기화 및 문서 처리
+        print("\n🔧 DocumentAgent 초기화 중...")
+        from src.agents.document_agent import DocumentAgent  # 실제 임포트 경로에 맞게 수정
         
-        for issue in type_issues:
-            print(f"   🔍 {issue.original_text[:30]}...")
-            print(f"      메시지: {issue.message}")
-            print(f"      제안: {issue.suggestion}")
-            print(f"      신뢰도: {issue.confidence:.2f}")
-            if issue.element_id:
-                print(f"      요소 ID: {issue.element_id}")
-            print(f"      위치: {issue.page_id}")
-    
-    print(f"\n📊 이슈 요약:")
-    print(f"   텍스트 이슈: {len(issue_by_type.get('typo', []) + issue_by_type.get('consistency', []) + issue_by_type.get('grammar', []))}개")
-    print(f"   이미지 품질: {len(issue_by_type.get('image_quality', []))}개")
-    print(f"   표 형식: {len(issue_by_type.get('table_format', []))}개")
-    print(f"   차트 가독성: {len(issue_by_type.get('chart_readability', []))}개")
-    
-    print("\n🎉 MultimodalQualityAgent 테스트 완료!")
+        document_agent = DocumentAgent(
+            openai_api_key=api_key,
+            vision_model="gpt-5-nano",
+            embedding_model="text-embedding-3-small"
+        )
+        
+        print(f"📖 문서 처리 중: {test_file}")
+        doc_meta = await document_agent.process_document(test_file)
+        
+        print(f"✅ 문서 처리 완료!")
+        print(f"   문서 ID: {doc_meta.doc_id}")
+        print(f"   제목: {doc_meta.title}")
+        print(f"   슬라이드 수: {doc_meta.total_pages}")
+        
+        # 2. 슬라이드 데이터 확인
+        slide_data_list = document_agent.get_slide_data(doc_meta.doc_id)
+        print(f"   생성된 슬라이드 데이터: {len(slide_data_list)}개")
+        
+        # 첫 번째 슬라이드 정보 출력
+        if slide_data_list:
+            first_slide = slide_data_list[0]
+            print(f"   첫 슬라이드 캡션: {first_slide.get('caption', 'None')[:100]}...")
+            print(f"   이미지 데이터: {'있음' if first_slide.get('image_base64') else '없음'}")
+        
+        # 3. QualityAgent 초기화 및 품질 검수
+        print("\n🔍 QualityAgent 초기화 중...")
+        config = QualityConfig(
+            max_issues_per_slide=3,
+            confidence_threshold=0.7,
+            issue_severity_filter="medium"
+        )
+        
+        quality_agent = QualityAgent(
+            openai_api_key=api_key,
+            vision_model="gpt-4o",
+            config=config
+        )
+        
+        print("📋 품질 검수 실행 중... (Vision 모델 사용)")
+        print("   ⏳ 이 과정은 몇 분이 소요될 수 있습니다.")
+        
+        issues = await quality_agent.analyze_document(document_agent, doc_meta.doc_id)
+        
+        # 4. 결과 출력
+        print(f"\n📋 발견된 이슈들 ({len(issues)}개):")
+        
+        if not issues:
+            print("   🎉 발견된 품질 이슈가 없습니다!")
+        else:
+            # 이슈 출력
+            for i, issue in enumerate(issues, 1):
+                print(f"\n{i}. [{issue.issue_type.value.upper()}] {issue.page_id}")
+                print(f"   원본: {issue.original_text[:50]}{'...' if len(issue.original_text) > 50 else ''}")
+                print(f"   문제: {issue.message}")
+                print(f"   제안: {issue.suggestion}")
+                print(f"   신뢰도: {issue.confidence:.2f}")
+                print(f"   에이전트: {issue.agent_name}")
+        
+        # 5. 품질 요약
+        summary = quality_agent.get_quality_summary(issues)
+        print(f"\n📊 품질 요약:")
+        print(f"   전체 이슈: {summary['total_issues']}개")
+        print(f"   품질 점수: {summary['quality_score']:.2f}/1.0")
+        
+        if summary['by_type']:
+            print(f"\n📈 이슈 유형별 분포:")
+            for issue_type, count in summary['by_type'].items():
+                print(f"   {issue_type}: {count}개")
+        
+        if summary['by_severity']:
+            print(f"\n⚖️ 심각도별 분포:")
+            for severity, count in summary['by_severity'].items():
+                print(f"   {severity}: {count}개")
+        
+        print(f"\n🎯 권장사항:")
+        for rec in summary['recommendations']:
+            print(f"   - {rec}")
+        
+        # 6. 추가 정보
+        stats = document_agent.get_document_stats(doc_meta.doc_id)
+        print(f"\n📈 문서 통계:")
+        print(f"   캡션 생성률: {stats['caption_coverage']:.1%}")
+        print(f"   평균 캡션 길이: {stats['avg_caption_length']:.0f}자")
+        print(f"   총 이미지 크기: {stats['total_image_size_mb']:.1f}MB")
+        
+        print("\n🎉 E2E 테스트 완료!")
+        
+    except ImportError as e:
+        print(f"❌ 모듈 임포트 실패: {str(e)}")
+        print("   DocumentAgent 클래스의 임포트 경로를 확인해주세요.")
+        
+    except FileNotFoundError as e:
+        print(f"❌ 파일 오류: {str(e)}")
+        
+    except Exception as e:
+        print(f"❌ 테스트 실패: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
-    asyncio.run(test_multimodal_quality_agent())
+    asyncio.run(test_quality_agent_e2e())
