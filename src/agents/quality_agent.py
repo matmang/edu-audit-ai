@@ -49,8 +49,8 @@ class QualityAgent:
     def __init__(
         self,
         openai_api_key: Optional[str] = None,
-        model: str = "gpt-4o",
-        vision_model: str = "gpt-4o",
+        model: str = "gpt-5-nano",
+        vision_model: str = "gpt-5-nano",
         config: Optional[QualityConfig] = None
     ):
         self.openai_api_key = openai_api_key
@@ -98,7 +98,6 @@ class QualityAgent:
 **검출 대상 이슈 유형:**
 - typo: 이미지 내 텍스트의 명백한 오탈자
 - grammar: 이미지 내 텍스트의 문법 오류
-- consistency: 용어나 표기법 불일치
 - fact: 명백한 사실 오류나 잘못된 정보
 - image_quality: 이미지 해상도, 선명도, 가독성 문제
 - content_clarity: 내용 전달의 명료성 문제
@@ -120,7 +119,7 @@ class QualityAgent:
 응답은 반드시 JSON 배열 형태로 해주세요:
 [
     {
-        "issue_type": "typo|grammar|consistency|fact|image_quality|content_clarity|layout_",
+        "issue_type": "typo|grammar|fact|image_quality|content_clarity|layout",
         "original_text": "문제가 있는 원본 텍스트 (이미지에서 발견된)",
         "message": "구체적인 문제점 설명",
         "suggestion": "수정 제안",
@@ -171,8 +170,8 @@ class QualityAgent:
                 continue
         
         # 문서 레벨 일관성 검사
-        document_issues = await self._analyze_document_consistency(slide_data_list, doc_meta)
-        all_issues.extend(document_issues)
+        # document_issues = await self._analyze_document_consistency(slide_data_list, doc_meta)
+        # all_issues.extend(document_issues)
         
         # 최종 필터링
         filtered_issues = self._filter_issues(all_issues)
@@ -259,6 +258,7 @@ class QualityAgent:
             )
             
             response_text = response.choices[0].message.content.strip()
+
             
             # JSON 파싱
             if response_text.startswith("```json"):
@@ -444,91 +444,91 @@ class QualityAgent:
         return None
     
     
-    async def _analyze_document_consistency(self, slide_data_list: List[Dict[str, Any]], doc_meta: DocumentMeta) -> List[Issue]:
-        """문서 전체 일관성 분석 - 캡션 기반"""
-        if len(slide_data_list) < 2:
-            return []
+#     async def _analyze_document_consistency(self, slide_data_list: List[Dict[str, Any]], doc_meta: DocumentMeta) -> List[Issue]:
+#         """문서 전체 일관성 분석 - 캡션 기반"""
+#         if len(slide_data_list) < 2:
+#             return []
         
-        try:
-            # 모든 캡션 결합 (이미지 분석은 개별 슬라이드에서 수행)
-            all_captions = []
-            for slide in slide_data_list:
-                if slide.get("caption"):
-                    all_captions.append(f"슬라이드 {slide['page_number']}: {slide['caption']}")
+#         try:
+#             # 모든 캡션 결합 (이미지 분석은 개별 슬라이드에서 수행)
+#             all_captions = []
+#             for slide in slide_data_list:
+#                 if slide.get("caption"):
+#                     all_captions.append(f"슬라이드 {slide['page_number']}: {slide['caption']}")
             
-            if len(all_captions) < 2:
-                return []
+#             if len(all_captions) < 2:
+#                 return []
             
-            combined_text = "\n\n".join(all_captions)
+#             combined_text = "\n\n".join(all_captions)
             
-            consistency_prompt = f"""다음은 교육자료의 모든 슬라이드 AI 생성 캡션입니다:
+#             consistency_prompt = f"""다음은 교육자료의 모든 슬라이드 AI 생성 캡션입니다:
 
-{combined_text}
+# {combined_text}
 
-문서 전체에서 다음 일관성 문제를 찾아주세요:
-1. 동일한 개념에 대한 다른 용어 사용 (예: "머신러닝" vs "기계학습")
-2. 설명 스타일의 심각한 불일치
-3. 논리적 순서나 구조의 문제
-4. 전체적인 교육 흐름의 문제
+# 문서 전체에서 다음 일관성 문제를 찾아주세요:
+# 1. 동일한 개념에 대한 다른 용어 사용 (예: "머신러닝" vs "기계학습")
+# 2. 설명 스타일의 심각한 불일치
+# 3. 논리적 순서나 구조의 문제
+# 4. 전체적인 교육 흐름의 문제
 
-중요한 일관성 문제만 JSON 배열로 반환해주세요:
-[{{"issue_type": "consistency", "message": "...", "suggestion": "...", "affected_slides": [1, 2, 3], "confidence": 0.0-1.0}}]
+# 중요한 일관성 문제만 JSON 배열로 반환해주세요:
+# [{{"issue_type": "consistency", "message": "...", "suggestion": "...", "affected_slides": [1, 2, 3], "confidence": 0.0-1.0}}]
 
-문제가 없으면 빈 배열 []을 반환하세요."""
+# 문제가 없으면 빈 배열 []을 반환하세요."""
 
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": "당신은 교육자료 일관성 검수 전문가입니다."},
-                    {"role": "user", "content": consistency_prompt}
-                ],
-            )
+#             response = await self.client.chat.completions.create(
+#                 model=self.model,
+#                 messages=[
+#                     {"role": "system", "content": "당신은 교육자료 일관성 검수 전문가입니다."},
+#                     {"role": "user", "content": consistency_prompt}
+#                 ],
+#             )
             
-            response_text = response.choices[0].message.content.strip()
+#             response_text = response.choices[0].message.content.strip()
             
-            # JSON 파싱
-            if response_text.startswith("```json"):
-                response_text = response_text.split("```json")[1].split("```")[0].strip()
-            elif response_text.startswith("```"):
-                response_text = response_text.split("```")[1].split("```")[0].strip()
+#             # JSON 파싱
+#             if response_text.startswith("```json"):
+#                 response_text = response_text.split("```json")[1].split("```")[0].strip()
+#             elif response_text.startswith("```"):
+#                 response_text = response_text.split("```")[1].split("```")[0].strip()
             
-            consistency_data = json.loads(response_text)
+#             consistency_data = json.loads(response_text)
             
-            # 문서 레벨 이슈로 변환
-            document_issues = []
-            for issue_data in consistency_data:
-                if issue_data.get("confidence", 0.8) >= self.config.confidence_threshold:
-                    # 첫 번째 슬라이드에 이슈 할당
-                    first_slide = slide_data_list[0]
+#             # 문서 레벨 이슈로 변환
+#             document_issues = []
+#             for issue_data in consistency_data:
+#                 if issue_data.get("confidence", 0.8) >= self.config.confidence_threshold:
+#                     # 첫 번째 슬라이드에 이슈 할당
+#                     first_slide = slide_data_list[0]
                     
-                    issue = Issue(
-                        issue_id=generate_issue_id(
-                            doc_meta.doc_id,
-                            first_slide["page_id"],
-                            TextLocation(start=0, end=1),
-                            IssueType.CONSISTENCY
-                        ),
-                        doc_id=doc_meta.doc_id,
-                        page_id=first_slide["page_id"],
-                        issue_type=IssueType.CONSISTENCY,
-                        text_location=None,
-                        bbox_location=None,
-                        element_id=None,
-                        original_text="문서 전체",
-                        message=f"[문서 일관성] {issue_data['message']}",
-                        suggestion=issue_data.get("suggestion", ""),
-                        confidence=issue_data.get("confidence", 0.8),
-                        confidence_level="medium",
-                        agent_name="quality_agent_consistency"
-                    )
+#                     issue = Issue(
+#                         issue_id=generate_issue_id(
+#                             doc_meta.doc_id,
+#                             first_slide["page_id"],
+#                             TextLocation(start=0, end=1),
+#                             IssueType.CONSISTENCY
+#                         ),
+#                         doc_id=doc_meta.doc_id,
+#                         page_id=first_slide["page_id"],
+#                         issue_type=IssueType.CONSISTENCY,
+#                         text_location=None,
+#                         bbox_location=None,
+#                         element_id=None,
+#                         original_text="문서 전체",
+#                         message=f"[문서 일관성] {issue_data['message']}",
+#                         suggestion=issue_data.get("suggestion", ""),
+#                         confidence=issue_data.get("confidence", 0.8),
+#                         confidence_level="medium",
+#                         agent_name="quality_agent_consistency"
+#                     )
                     
-                    document_issues.append(issue)
+#                     document_issues.append(issue)
             
-            return document_issues
+#             return document_issues
             
-        except Exception as e:
-            logger.warning(f"문서 일관성 분석 실패: {str(e)}")
-            return []
+#         except Exception as e:
+#             logger.warning(f"문서 일관성 분석 실패: {str(e)}")
+#             return []
     
     def _filter_issues(self, issues: List[Issue]) -> List[Issue]:
         """최종 이슈 필터링"""
@@ -623,351 +623,6 @@ class QualityAgent:
             "by_severity": by_severity,
             "recommendations": recommendations
         }
-    async def _analyze_slide_vision(self, slide_data: Dict[str, Any], doc_meta: DocumentMeta) -> List[Issue]:
-        """Vision 모델을 통한 슬라이드 이미지 품질 분석"""
-        if not slide_data.get("image_base64"):
-            return []
-        
-        try:
-            vision_prompt = """이 교육자료 슬라이드의 시각적 품질을 분석해주세요.
-
-다음 관점에서 학습에 방해가 될 수 있는 문제만 찾아주세요:
-1. 텍스트 가독성 (너무 작거나 흐린 글씨)
-2. 이미지 품질 (해상도, 선명도)
-3. 색상 대비 (구분 어려운 색상)
-4. 레이아웃 (정보 전달에 방해되는 배치)
-
-중요한 문제만 JSON 배열로 반환해주세요:
-[{"issue_type": "image_quality", "message": "...", "suggestion": "...", "confidence": 0.0-1.0}]
-
-문제가 없으면 빈 배열 []을 반환하세요."""
-
-            response = await self.client.chat.completions.create(
-                model=self.vision_model,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": vision_prompt
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/png;base64,{slide_data['image_base64']}",
-                                    "detail": "high"
-                                }
-                            }
-                        ]
-                    }
-                ],
-            )
-            
-            response_text = response.choices[0].message.content.strip()
-            
-            # JSON 파싱 및 Issue 변환
-            if response_text.startswith("```json"):
-                response_text = response_text.split("```json")[1].split("```")[0].strip()
-            elif response_text.startswith("```"):
-                response_text = response_text.split("```")[1].split("```")[0].strip()
-            
-            vision_issues_data = json.loads(response_text)
-            vision_issues = self._convert_to_issues(vision_issues_data, slide_data, doc_meta)
-            
-            return vision_issues
-            
-        except Exception as e:
-            logger.warning(f"Vision 분석 실패: {str(e)}")
-            return []
-    
-    async def _analyze_document_consistency(self, slide_data_list: List[Dict[str, Any]], doc_meta: DocumentMeta) -> List[Issue]:
-        """문서 전체 일관성 분석"""
-        if len(slide_data_list) < 2:
-            return []
-        
-        try:
-            # 모든 캡션 결합
-            all_captions = []
-            for slide in slide_data_list:
-                if slide.get("caption"):
-                    all_captions.append(f"슬라이드 {slide['page_number']}: {slide['caption']}")
-            
-            if len(all_captions) < 2:
-                return []
-            
-            combined_text = "\n\n".join(all_captions)
-            
-            consistency_prompt = f"""다음은 교육자료의 모든 슬라이드 설명입니다:
-
-{combined_text}
-
-문서 전체에서 다음 일관성 문제를 찾아주세요:
-1. 동일한 개념에 대한 다른 용어 사용 (예: "머신러닝" vs "기계학습")
-2. 설명 스타일의 심각한 불일치
-3. 논리적 순서나 구조의 문제
-
-중요한 일관성 문제만 JSON 배열로 반환해주세요:
-[{"issue_type": "consistency", "message": "...", "suggestion": "...", "affected_slides": [1, 2, 3]}]
-
-문제가 없으면 빈 배열 []을 반환하세요."""
-
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": "당신은 교육자료 일관성 검수 전문가입니다."},
-                    {"role": "user", "content": consistency_prompt}
-                ],
-            )
-            
-            response_text = response.choices[0].message.content.strip()
-            
-            # JSON 파싱
-            if response_text.startswith("```json"):
-                response_text = response_text.split("```json")[1].split("```")[0].strip()
-            elif response_text.startswith("```"):
-                response_text = response_text.split("```")[1].split("```")[0].strip()
-            
-            consistency_data = json.loads(response_text)
-            
-            # 문서 레벨 이슈로 변환
-            document_issues = []
-            for issue_data in consistency_data:
-                if issue_data.get("confidence", 0.8) >= self.config.confidence_threshold:
-                    # 첫 번째 슬라이드에 이슈 할당
-                    first_slide = slide_data_list[0]
-                    
-                    issue = Issue(
-                        issue_id=generate_issue_id(
-                            doc_meta.doc_id,
-                            first_slide["page_id"],
-                            TextLocation(start=0, end=1),
-                            IssueType.CONSISTENCY
-                        ),
-                        doc_id=doc_meta.doc_id,
-                        page_id=first_slide["page_id"],
-                        issue_type=IssueType.CONSISTENCY,
-                        text_location=None,
-                        bbox_location=None,
-                        element_id=None,
-                        original_text="문서 전체",
-                        message=f"[문서 일관성] {issue_data['message']}",
-                        suggestion=issue_data.get("suggestion", ""),
-                        confidence=issue_data.get("confidence", 0.8),
-                        confidence_level="medium",
-                        agent_name="quality_agent"
-                    )
-                    
-                    document_issues.append(issue)
-            
-            return document_issues
-            
-        except Exception as e:
-            logger.warning(f"문서 일관성 분석 실패: {str(e)}")
-            return []
-    
-    def _filter_issues(self, issues: List[Issue]) -> List[Issue]:
-        """최종 이슈 필터링"""
-        filtered = []
-        
-        for issue in issues:
-            # 신뢰도 필터
-            if issue.confidence < self.config.confidence_threshold:
-                continue
-            
-            # 중복 제거 (같은 페이지, 같은 타입, 비슷한 메시지)
-            is_duplicate = False
-            for existing in filtered:
-                if (existing.page_id == issue.page_id and 
-                    existing.issue_type == issue.issue_type and
-                    self._similar_messages(existing.message, issue.message)):
-                    is_duplicate = True
-                    break
-            
-            if not is_duplicate:
-                filtered.append(issue)
-        
-        # 심각도 기준 정렬
-        filtered.sort(key=lambda x: (
-            x.issue_type == IssueType.FACT,  # 사실 오류 우선
-            x.confidence
-        ), reverse=True)
-        
-        return filtered
-    
-    def _similar_messages(self, msg1: str, msg2: str, threshold: float = 0.8) -> bool:
-        """메시지 유사도 확인 (간단한 문자열 비교)"""
-        if not msg1 or not msg2:
-            return False
-        
-        # 간단한 Jaccard 유사도
-        words1 = set(msg1.lower().split())
-        words2 = set(msg2.lower().split())
-        
-        if not words1 or not words2:
-            return False
-        
-        intersection = len(words1 & words2)
-        union = len(words1 | words2)
-        
-        return (intersection / union) > threshold
-    
-    def get_quality_summary(self, issues: List[Issue]) -> Dict[str, Any]:
-        """품질 검수 결과 요약"""
-        if not issues:
-            return {
-                "total_issues": 0,
-                "quality_score": 1.0,
-                "by_type": {},
-                "by_severity": {},
-                "recommendations": ["문서 품질이 우수합니다."]
-            }
-        
-        # 타입별 분류
-        by_type = {}
-        by_severity = {"high": 0, "medium": 0, "low": 0}
-        
-        for issue in issues:
-            issue_type = issue.issue_type.value
-            by_type[issue_type] = by_type.get(issue_type, 0) + 1
-            
-            if issue.confidence >= 0.9:
-                by_severity["high"] += 1
-            elif issue.confidence >= 0.7:
-                by_severity["medium"] += 1
-            else:
-                by_severity["low"] += 1
-        
-        # 품질 점수 계산 (0.0 ~ 1.0)
-        quality_score = max(0.0, 1.0 - (len(issues) * 0.1))
-        
-        # 권장사항 생성
-        recommendations = []
-        if by_type.get("fact", 0) > 0:
-            recommendations.append("사실 확인이 필요한 내용이 있습니다.")
-        if by_type.get("typo", 0) > 0:
-            recommendations.append("오탈자 교정이 필요합니다.")
-        if by_type.get("consistency", 0) > 0:
-            recommendations.append("용어 사용의 일관성을 확인해주세요.")
-        if by_type.get("image_quality", 0) > 0:
-            recommendations.append("이미지 품질 개선을 고려해주세요.")
-        
-        return {
-            "total_issues": len(issues),
-            "quality_score": quality_score,
-            "by_type": by_type,
-            "by_severity": by_severity,
-            "recommendations": recommendations
-        }
-
-
-# 테스트 함수
-async def test_quality_agent():
-    """QualityAgent 테스트"""
-    print("🧪 QualityAgent 테스트 시작...")
-    
-    import os
-    from dotenv import load_dotenv
-    from pathlib import Path
-    
-    env_path = Path(__file__).resolve().parents[2] / '.env.dev'
-    load_dotenv(env_path)
-    api_key = os.getenv("OPENAI_API_KEY")
-    
-    if not api_key:
-        print("❌ OPENAI_API_KEY 환경변수가 설정되지 않았습니다.")
-        return
-    
-    # 설정
-    config = QualityConfig(
-        max_issues_per_slide=2,
-        confidence_threshold=0.7,
-        enable_vision_analysis=False,  # 테스트에서는 비활성화
-        issue_severity_filter="medium"
-    )
-    
-    # 에이전트 생성
-    agent = QualityAgent(
-        openai_api_key=api_key,
-        model="gpt-4o",
-        config=config
-    )
-    
-    # 테스트용 DocumentAgent 모의 객체
-    class MockDocumentAgent:
-        def get_document(self, doc_id):
-            from src.core.models import DocumentMeta
-            return DocumentMeta(
-                doc_id=doc_id,
-                title="테스트 교육자료",
-                doc_type="pdf",
-                total_pages=3,
-                file_path="test.pdf"
-            )
-        
-        def get_slide_data(self, doc_id):
-            return [
-                {
-                    "doc_id": doc_id,
-                    "page_id": "p001",
-                    "page_number": 1,
-                    "caption": "딥러닝과 심층학습을 사용한 알고리듬 연구입니다. 데이타 전처리가 중요합니다.",
-                    "slide_text": "머신 러닝 개요\n- 알고리듬의 종류\n- 데이타 분석 방법",
-                    "dimensions": (1920, 1080),
-                    "size_bytes": 123456
-                },
-                {
-                    "doc_id": doc_id,
-                    "page_id": "p002", 
-                    "page_number": 2,
-                    "caption": "기계학습의 핵심은 패턴 인식입니다. 충분한 학습 데이터가 있어야 합니다.",
-                    "slide_text": "패턴 인식\n- 지도 학습\n- 비지도 학습",
-                    "dimensions": (1920, 1080),
-                    "size_bytes": 98765
-                },
-                {
-                    "doc_id": doc_id,
-                    "page_id": "p003",
-                    "page_number": 3,
-                    "caption": "신경망은 뇌의 구조를 모방한 알고리즘입니다. 역전파를 통해 학습합니다.",
-                    "slide_text": "신경망 구조\n- 입력층\n- 은닉층\n- 출력층",
-                    "dimensions": (1920, 1080),
-                    "size_bytes": 87654
-                }
-            ]
-    
-    mock_doc_agent = MockDocumentAgent()
-    test_doc_id = "test_doc_001"
-    
-    # 품질 검수 실행
-    print("\n🔍 품질 검수 실행 중...")
-    issues = await agent.analyze_document(mock_doc_agent, test_doc_id)
-    
-    print(f"\n📋 발견된 이슈들 ({len(issues)}개):")
-    
-    # 이슈 출력
-    for i, issue in enumerate(issues, 1):
-        print(f"\n{i}. [{issue.issue_type.value.upper()}] {issue.page_id}")
-        print(f"   원본: {issue.original_text}")
-        print(f"   문제: {issue.message}")
-        print(f"   제안: {issue.suggestion}")
-        print(f"   신뢰도: {issue.confidence:.2f}")
-    
-    # 품질 요약
-    summary = agent.get_quality_summary(issues)
-    print(f"\n📊 품질 요약:")
-    print(f"   전체 이슈: {summary['total_issues']}개")
-    print(f"   품질 점수: {summary['quality_score']:.2f}/1.0")
-    
-    print(f"\n📈 이슈 유형별 분포:")
-    for issue_type, count in summary['by_type'].items():
-        print(f"   {issue_type}: {count}개")
-    
-    print(f"\n🎯 권장사항:")
-    for rec in summary['recommendations']:
-        print(f"   - {rec}")
-    
-    print("\n🎉 QualityAgent 테스트 완료!")
 
 async def test_quality_agent_e2e():
     """QualityAgent E2E 테스트 - DocumentAgent와 연동"""
@@ -1042,7 +697,7 @@ async def test_quality_agent_e2e():
         
         quality_agent = QualityAgent(
             openai_api_key=api_key,
-            vision_model="gpt-4o",
+            vision_model="gpt-5-nano",
             config=config
         )
         

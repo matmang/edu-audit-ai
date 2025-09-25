@@ -1,191 +1,98 @@
 """
-EDU-Audit Fact Check Agent
-사실 검증 및 정보 최신성 검사 에이전트
+EDU-Audit Fact Check Agent - Efficient & Selective
+선택적 팩트체킹 에이전트 (LLM 필터 → 검색 → 대조 → 이슈화)
 """
 
 import asyncio
 import logging
-import re
 import json
-from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Any, Tuple
+import re
+from datetime import datetime
+from typing import List, Dict, Optional, Any, Set
 from dataclasses import dataclass
-from urllib.parse import quote
 
 import aiohttp
-from llama_index.llms.openai import OpenAI
+from openai import AsyncOpenAI
 
 from src.core.models import (
-    DocumentMeta, PageInfo, PageElement, ElementType, Issue, IssueType,
-    FactCheckRequest, FactCheckResult, TextLocation, BoundingBox,
+    DocumentMeta, Issue, IssueType, TextLocation,
     generate_issue_id
 )
 
 logger = logging.getLogger(__name__)
 
-
 @dataclass
-class FactCheckRule:
-    """사실 검증 규칙"""
-    domains: List[str]  # 적용 도메인 (science, technology, history, etc.)
-    claim_patterns: List[str]  # 검증이 필요한 문장 패턴
-    confidence_threshold: float = 0.7  # 신뢰도 임계값
-    require_sources: bool = True  # 출처 필요 여부
-
+class FactCheckTrigger:
+    """팩트체크 필요 여부 판단 결과"""
+    factcheck_required: bool
+    reason: str
+    keywords: List[str]
+    confidence: float
 
 @dataclass
 class SearchResult:
-    """검색 결과"""
+    """외부 검색 결과"""
     title: str
     url: str
     snippet: str
-    published_date: Optional[str] = None
-    source_domain: str = ""
-    relevance_score: float = 0.0
-
+    source_domain: str
 
 @dataclass
 class FactVerification:
-    """사실 검증 결과"""
+    """팩트체크 검증 결과"""
     claim: str
-    is_factual: bool
+    is_accurate: bool
+    is_outdated: bool
     confidence: float
-    evidence: List[SearchResult]
     reasoning: str
-    is_outdated: bool = False
-    last_updated: Optional[str] = None
-    contradictory_info: Optional[str] = None
-
+    search_results: List[SearchResult]
 
 class FactCheckAgent:
-    """사실 검증 에이전트"""
+    """
+    선택적 팩트체킹 에이전트
+    
+    파이프라인:
+    1. LLM 필터: 팩트체크 필요 여부 판단
+    2. 검색 실행: 필요한 경우만 외부 검색
+    3. 대조 단계: 검색 결과 vs 슬라이드 내용 비교
+    4. 이슈화: 문제가 있는 경우만 Issue 생성
+    """
     
     def __init__(
         self,
         openai_api_key: Optional[str] = None,
         serpapi_key: Optional[str] = None,
-        llm_model: str = "gpt-5-nano",
+        model: str = "gpt-5-nano",
         max_search_results: int = 5,
-        fact_check_timeout: int = 30
+        search_timeout: int = 10
     ):
         self.openai_api_key = openai_api_key
         self.serpapi_key = serpapi_key
+        self.model = model
         self.max_search_results = max_search_results
-        self.fact_check_timeout = fact_check_timeout
+        self.search_timeout = search_timeout
         
-        # LLM 초기화
-        self.llm = None
-        if openai_api_key:
-            self.llm = OpenAI(
-                model=llm_model,
-                temperature=0.1,  # 일관된 분석을 위해 낮게 설정
-                api_key=openai_api_key
-            )
+        if not openai_api_key:
+            raise ValueError("OpenAI API Key가 필요합니다.")
         
-        # HTTP 클라이언트
+        # OpenAI 클라이언트
+        self.client = AsyncOpenAI(api_key=openai_api_key)
+        
+        # HTTP 세션 (검색용)
         self.session = None
         
-        # 사실 검증 규칙 로드
-        self._load_fact_check_rules()
+        # 캐시 (중복 검색 방지)
+        self.search_cache: Dict[str, List[SearchResult]] = {}
+        self.verification_cache: Dict[str, FactVerification] = {}
         
-        # 신뢰할 수 있는 소스 목록
-        self._load_trusted_sources()
-        
-        logger.info("FactCheckAgent 초기화 완료")
-        if not openai_api_key:
-            logger.warning("OpenAI API 키가 없습니다. LLM 분석이 제한됩니다.")
-        if not serpapi_key:
-            logger.warning("SerpAPI 키가 없습니다. 웹 검색이 제한됩니다.")
-    
-    def _load_fact_check_rules(self):
-        """사실 검증 규칙 로드"""
-        self.fact_check_rules = [
-            FactCheckRule(
-                domains=["science", "technology", "research"],
-                claim_patterns=[
-                    r"연구에 따르면",
-                    r"최신 연구",
-                    r"[0-9]{4}년.*연구",
-                    r"실험 결과",
-                    r"과학자들은.*발견",
-                    r"통계에 의하면",
-                    r"데이터에 따르면"
-                ],
-                confidence_threshold=0.8,
-                require_sources=True
-            ),
-            FactCheckRule(
-                domains=["statistics", "data", "numbers"],
-                claim_patterns=[
-                    r"[0-9]+%",
-                    r"[0-9,]+명",
-                    r"[0-9,]+개",
-                    r"순위.*[0-9]+위",
-                    r"증가.*[0-9]+%",
-                    r"감소.*[0-9]+%"
-                ],
-                confidence_threshold=0.7,
-                require_sources=True
-            ),
-            FactCheckRule(
-                domains=["technology", "software", "ai"],
-                claim_patterns=[
-                    r"최신 버전",
-                    r"새로운 기능",
-                    r"업데이트",
-                    r"[0-9]{4}년.*출시",
-                    r"현재.*지원",
-                    r"GPT-[0-9]+",
-                    r"ChatGPT",
-                    r"최신.*모델"
-                ],
-                confidence_threshold=0.6,
-                require_sources=False
-            ),
-            FactCheckRule(
-                domains=["events", "news", "current"],
-                claim_patterns=[
-                    r"최근.*발표",
-                    r"올해",
-                    r"이번 달",
-                    r"현재.*상황",
-                    r"작년",
-                    r"[0-9]{4}년.*월"
-                ],
-                confidence_threshold=0.8,
-                require_sources=True
-            )
-        ]
-    
-    def _load_trusted_sources(self):
-        """신뢰할 수 있는 소스 목록 로드"""
-        self.trusted_sources = {
-            # 학술/연구 소스
-            "academic": [
-                "arxiv.org", "pubmed.ncbi.nlm.nih.gov", "scholar.google.com",
-                "ieee.org", "acm.org", "nature.com", "science.org",
-                "springer.com", "elsevier.com"
-            ],
-            # 뉴스/미디어 소스
-            "news": [
-                "bbc.com", "reuters.com", "ap.org", "nytimes.com",
-                "washingtonpost.com", "cnn.com", "npr.org"
-            ],
-            # 기술 소스
-            "technology": [
-                "github.com", "stackoverflow.com", "developer.mozilla.org",
-                "techcrunch.com", "arstechnica.com", "wired.com"
-            ],
-            # 정부/공식 소스
-            "official": [
-                ".gov", ".edu", "who.int", "unesco.org", "un.org"
-            ]
-        }
+        logger.info(f"FactCheckAgent 초기화 완료")
+        logger.info(f"  모델: {model}")
+        logger.info(f"  검색 API: {'활성화' if serpapi_key else '비활성화'}")
     
     async def __aenter__(self):
-        """비동기 컨텍스트 매니저 진입"""
+        """비동기 컨텍스트 매니저"""
         self.session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=self.fact_check_timeout)
+            timeout=aiohttp.ClientTimeout(total=self.search_timeout)
         )
         return self
     
@@ -194,342 +101,262 @@ class FactCheckAgent:
         if self.session:
             await self.session.close()
     
-    async def check_document_facts(self, doc_meta: DocumentMeta, pages: List[PageInfo]) -> List[Issue]:
+    async def analyze_document(self, document_agent, doc_id: str) -> List[Issue]:
         """
-        문서 전체 사실 검증
+        DocumentAgent에서 처리된 문서의 팩트체킹 분석
         
         Args:
-            doc_meta: 문서 메타데이터
-            pages: 페이지 목록
+            document_agent: DocumentAgent 인스턴스
+            doc_id: 문서 ID
             
         Returns:
-            List[Issue]: 발견된 사실 오류 이슈들
+            List[Issue]: 발견된 팩트체킹 이슈들
         """
-        logger.info(f"문서 사실 검증 시작: {doc_meta.doc_id}")
+        logger.info(f"팩트체킹 분석 시작: {doc_id}")
+        
+        # DocumentAgent에서 슬라이드 데이터 가져오기
+        doc_meta = document_agent.get_document(doc_id)
+        slide_data_list = document_agent.get_slide_data(doc_id)
+        
+        if not doc_meta or not slide_data_list:
+            logger.warning(f"문서 데이터가 없습니다: {doc_id}")
+            return []
         
         all_issues = []
         
         async with self:
-            for page in pages:
-                # 1. 페이지 텍스트에서 검증 대상 추출
-                text_claims = await self._extract_fact_claims(page.raw_text)
-                
-                for claim in text_claims:
-                    page_issues = await self._verify_claim_in_page(
-                        doc_meta, page, claim, page.raw_text
+            # 1단계: 각 슬라이드별 팩트체크 필요 여부 판단
+            factcheck_candidates = []
+            
+            for slide_data in slide_data_list:
+                try:
+                    trigger = await self._check_factcheck_trigger(slide_data)
+                    
+                    if trigger.factcheck_required:
+                        factcheck_candidates.append({
+                            "slide_data": slide_data,
+                            "trigger": trigger
+                        })
+                        logger.info(f"팩트체크 대상: {slide_data['page_id']} - {trigger.reason}")
+                    
+                    # API 레이트 제한
+                    await asyncio.sleep(0.1)
+                    
+                except Exception as e:
+                    logger.warning(f"트리거 판단 실패 {slide_data['page_id']}: {str(e)}")
+                    continue
+            
+            logger.info(f"팩트체크 대상: {len(factcheck_candidates)}/{len(slide_data_list)} 슬라이드")
+            
+            # 2단계: 팩트체크 필요한 슬라이드만 처리
+            for candidate in factcheck_candidates:
+                try:
+                    slide_issues = await self._verify_slide_facts(
+                        candidate["slide_data"], 
+                        candidate["trigger"],
+                        doc_meta
                     )
-                    all_issues.extend(page_issues)
-                
-                # 2. 멀티모달 요소에서 검증 대상 추출
-                for element in page.elements:
-                    element_issues = await self._verify_multimodal_element(
-                        doc_meta, page, element
-                    )
-                    all_issues.extend(element_issues)
-                
-                # API 호출 제한
-                await asyncio.sleep(0.5)
+                    all_issues.extend(slide_issues)
+                    
+                    # 검색 API 레이트 제한
+                    await asyncio.sleep(0.5)
+                    
+                except Exception as e:
+                    logger.error(f"슬라이드 팩트체크 실패 {candidate['slide_data']['page_id']}: {str(e)}")
+                    continue
         
-        logger.info(f"사실 검증 완료: {len(all_issues)}개 이슈 발견")
+        logger.info(f"팩트체킹 분석 완료: {len(all_issues)}개 이슈 발견")
         return all_issues
     
-    async def verify_single_claim(self, claim: str, context: str = None) -> FactCheckResult:
-        """
-        단일 사실 주장 검증
+    async def _check_factcheck_trigger(self, slide_data: Dict[str, Any]) -> FactCheckTrigger:
+        """1단계: LLM으로 팩트체크 필요 여부 판단"""
         
-        Args:
-            claim: 검증할 주장
-            context: 문맥 정보
-            
-        Returns:
-            FactCheckResult: 검증 결과
-        """
-        logger.info(f"단일 사실 검증: {claim[:50]}...")
+        # 분석할 텍스트 준비
+        analysis_text = ""
+        if slide_data.get("caption"):
+            analysis_text += f"[캡션] {slide_data['caption']}"
         
-        async with self:
-            # 1. 웹 검색으로 관련 정보 수집
-            search_results = await self._search_for_claim(claim)
-            
-            # 2. LLM을 통한 사실 검증
-            verification = await self._verify_with_llm(claim, search_results, context)
-            
-            # 3. 최신성 검사
-            is_outdated, last_updated = await self._check_if_outdated(claim, search_results)
-            
-            result = FactCheckResult(
-                sentence=claim,
-                is_factual=verification.is_factual,
-                confidence=verification.confidence,
-                explanation=verification.reasoning,
-                sources=[result.url for result in verification.evidence],
-                checked_at=datetime.now()
+        if slide_data.get("slide_text"):
+            analysis_text += f"\n[텍스트] {slide_data['slide_text']}"
+        
+        if not analysis_text.strip():
+            return FactCheckTrigger(
+                factcheck_required=False,
+                reason="분석할 텍스트 없음",
+                keywords=[],
+                confidence=1.0
+            )
+        
+        trigger_prompt = f"""다음 교육 슬라이드 내용을 보고, 외부 검색을 통한 사실 확인이 필요한지 판단해주세요.
+
+슬라이드 내용:
+{analysis_text}
+
+**팩트체크가 필요한 경우:**
+- 구체적인 수치, 통계, 데이터 (예: "사용자 수 1억명", "정확도 95%")
+- 최신 연구 결과, 발표 내용 (예: "2024년 연구", "최근 발표")
+- 회사/제품 정보, 출시일 (예: "GPT-4 출시", "새로운 기능")
+- 법규, 정책, 현황 (예: "현재 규제", "정부 정책")
+- 시의성 있는 사건, 동향 (예: "올해 트렌드", "최근 변화")
+
+**팩트체크가 불필요한 경우:**
+- 수학 공식, 알고리즘 설명 (예: "θ = θ - η∇J(θ)")
+- 기본 개념 정의 (예: "머신러닝이란", "분류와 회귀")
+- 일반적인 설명, 원리 (예: "신경망 구조", "학습 과정")
+- 예시, 비유, 교육적 설명
+
+JSON 형식으로 응답해주세요:
+{{
+    "factcheck_required": true|false,
+    "reason": "판단 이유 (한 문장)",
+    "keywords": ["검색할", "핵심", "키워드"],
+    "confidence": 0.0-1.0
+}}"""
+
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "user", "content": trigger_prompt}
+                ],
             )
             
-            # 추가 정보
-            if is_outdated:
-                result.explanation += f"\n\n⚠️ 주의: 이 정보는 오래된 것일 수 있습니다 (마지막 업데이트: {last_updated})"
+            response_text = response.choices[0].message.content.strip()
             
-            if verification.contradictory_info:
-                result.explanation += f"\n\n🔄 상충 정보: {verification.contradictory_info}"
+            # JSON 파싱
+            if response_text.startswith("```json"):
+                response_text = response_text.split("```json")[1].split("```")[0].strip()
+            elif response_text.startswith("```"):
+                response_text = response_text.split("```")[1].split("```")[0].strip()
             
-            return result
+            result = json.loads(response_text)
+            
+            return FactCheckTrigger(
+                factcheck_required=result.get("factcheck_required", False),
+                reason=result.get("reason", "이유 없음"),
+                keywords=result.get("keywords", []),
+                confidence=result.get("confidence", 0.5)
+            )
+            
+        except json.JSONDecodeError as e:
+            logger.warning(f"트리거 판단 JSON 파싱 실패: {response_text[:100]}... - {str(e)}")
+            return FactCheckTrigger(
+                factcheck_required=False,
+                reason="응답 파싱 실패",
+                keywords=[],
+                confidence=0.1
+            )
+        except Exception as e:
+            logger.error(f"트리거 판단 실패: {str(e)}")
+            return FactCheckTrigger(
+                factcheck_required=False,
+                reason="판단 과정 오류",
+                keywords=[],
+                confidence=0.1
+            )
     
-    async def _extract_fact_claims(self, text: str) -> List[str]:
-        """텍스트에서 사실 검증이 필요한 주장들 추출"""
-        claims = []
-        
-        if not text.strip():
-            return claims
-        
-        # 문장 단위로 분할
-        sentences = re.split(r'[.!?]\s+', text)
-        
-        for sentence in sentences:
-            sentence = sentence.strip()
-            if len(sentence) < 10:  # 너무 짧은 문장은 제외
-                continue
-            
-            # 각 규칙에 대해 패턴 매칭
-            for rule in self.fact_check_rules:
-                for pattern in rule.claim_patterns:
-                    if re.search(pattern, sentence, re.IGNORECASE):
-                        claims.append(sentence)
-                        break
-        
-        # 중복 제거
-        return list(set(claims))
-    
-    async def _verify_claim_in_page(
+    async def _verify_slide_facts(
         self, 
-        doc_meta: DocumentMeta, 
-        page: PageInfo, 
-        claim: str,
-        full_text: str
+        slide_data: Dict[str, Any], 
+        trigger: FactCheckTrigger,
+        doc_meta: DocumentMeta
     ) -> List[Issue]:
-        """페이지 내 특정 주장 검증"""
+        """2-4단계: 검색 → 대조 → 이슈화"""
+        
         issues = []
         
-        try:
-            # 주장 검증 수행
-            verification = await self._perform_fact_verification(claim)
-            
-            if not verification.is_factual or verification.is_outdated:
-                # 원본 텍스트에서 위치 찾기
-                pos = full_text.find(claim)
-                if pos != -1:
-                    location = TextLocation(start=pos, end=pos + len(claim))
+        # 검색 키워드 준비
+        search_queries = self._prepare_search_queries(slide_data, trigger)
+        
+        for query in search_queries:
+            try:
+                # 캐시 확인
+                cache_key = f"{query}:{slide_data['page_id']}"
+                if cache_key in self.verification_cache:
+                    verification = self.verification_cache[cache_key]
+                    logger.info(f"캐시에서 검증 결과 사용: {query}")
                 else:
-                    # 부분 매칭 시도
-                    words = claim.split()[:5]  # 처음 5단어로 검색
-                    partial_claim = " ".join(words)
-                    pos = full_text.find(partial_claim)
-                    if pos != -1:
-                        location = TextLocation(start=pos, end=pos + len(partial_claim))
-                    else:
-                        location = TextLocation(start=0, end=len(claim))
+                    # 2단계: 외부 검색
+                    search_results = await self._search_external(query)
+                    
+                    # 3단계: 검색 결과와 슬라이드 내용 대조
+                    verification = await self._compare_with_search_results(
+                        slide_data, query, search_results
+                    )
+                    
+                    # 캐시에 저장
+                    self.verification_cache[cache_key] = verification
                 
-                # 이슈 타입 결정
-                if not verification.is_factual:
-                    issue_message = f"사실 오류 가능성: {verification.reasoning}"
-                    suggestion = "출처 확인 및 최신 정보 업데이트 필요"
-                else:  # is_outdated
-                    issue_message = f"정보가 오래되었을 수 있음: {verification.last_updated}"
-                    suggestion = "최신 정보로 업데이트 권장"
+                # 4단계: 문제가 있는 경우 이슈 생성
+                if not verification.is_accurate or verification.is_outdated:
+                    issue = self._create_fact_issue(
+                        slide_data, verification, doc_meta
+                    )
+                    issues.append(issue)
                 
-                issue_id = generate_issue_id(
-                    doc_meta.doc_id,
-                    page.page_id,
-                    location,
-                    IssueType.FACT
-                )
-                
-                issue = Issue(
-                    issue_id=issue_id,
-                    doc_id=doc_meta.doc_id,
-                    page_id=page.page_id,
-                    issue_type=IssueType.FACT,
-                    text_location=location,
-                    original_text=claim,
-                    message=issue_message,
-                    suggestion=suggestion,
-                    confidence=verification.confidence,
-                    confidence_level="high",  # Pydantic이 자동 계산
-                    agent_name="fact_check_agent"
-                )
-                
-                issues.append(issue)
-        
-        except Exception as e:
-            logger.warning(f"주장 검증 실패 '{claim[:30]}...': {str(e)}")
+            except Exception as e:
+                logger.warning(f"팩트체크 실패 '{query}': {str(e)}")
+                continue
         
         return issues
     
-    async def _verify_multimodal_element(
-        self, 
-        doc_meta: DocumentMeta, 
-        page: PageInfo, 
-        element: PageElement
-    ) -> List[Issue]:
-        """멀티모달 요소의 사실 검증"""
-        issues = []
+    def _prepare_search_queries(self, slide_data: Dict[str, Any], trigger: FactCheckTrigger) -> List[str]:
+        """검색 쿼리 준비"""
+        queries = []
         
-        try:
-            text_to_verify = None
-            
-            # 요소 타입별 텍스트 추출
-            if element.element_type == ElementType.IMAGE and element.image_data:
-                # OCR 텍스트와 AI 설명에서 검증 대상 찾기
-                if element.image_data.ocr_text:
-                    claims = await self._extract_fact_claims(element.image_data.ocr_text)
-                    for claim in claims:
-                        verification = await self._perform_fact_verification(claim)
-                        if not verification.is_factual or verification.is_outdated:
-                            issue = self._create_multimodal_fact_issue(
-                                doc_meta, page, element, claim, verification
-                            )
-                            issues.append(issue)
-                
-                if element.image_data.description:
-                    claims = await self._extract_fact_claims(element.image_data.description)
-                    for claim in claims:
-                        verification = await self._perform_fact_verification(claim)
-                        if not verification.is_factual or verification.is_outdated:
-                            issue = self._create_multimodal_fact_issue(
-                                doc_meta, page, element, claim, verification
-                            )
-                            issues.append(issue)
-            
-            elif element.element_type == ElementType.TABLE and element.table_data:
-                # 표 내용에서 숫자 데이터 검증
-                table_text = self._extract_table_text(element.table_data)
-                claims = await self._extract_fact_claims(table_text)
-                for claim in claims:
-                    verification = await self._perform_fact_verification(claim)
-                    if not verification.is_factual or verification.is_outdated:
-                        issue = self._create_multimodal_fact_issue(
-                            doc_meta, page, element, claim, verification
-                        )
-                        issues.append(issue)
-            
-            elif element.element_type == ElementType.CHART and element.chart_data:
-                # 차트 설명에서 데이터 관련 주장 검증
-                if element.chart_data.description:
-                    claims = await self._extract_fact_claims(element.chart_data.description)
-                    for claim in claims:
-                        verification = await self._perform_fact_verification(claim)
-                        if not verification.is_factual or verification.is_outdated:
-                            issue = self._create_multimodal_fact_issue(
-                                doc_meta, page, element, claim, verification
-                            )
-                            issues.append(issue)
+        # 트리거에서 추출한 키워드 사용
+        if trigger.keywords:
+            # 키워드 조합으로 검색 쿼리 생성
+            main_keywords = " ".join(trigger.keywords[:3])  # 상위 3개만
+            queries.append(main_keywords)
         
-        except Exception as e:
-            logger.warning(f"멀티모달 요소 검증 실패 {element.element_id}: {str(e)}")
+        # 캡션에서 숫자나 구체적 정보 추출
+        text_content = ""
+        if slide_data.get("caption"):
+            text_content += slide_data["caption"]
+        if slide_data.get("slide_text"):
+            text_content += " " + slide_data["slide_text"]
         
-        return issues
+        # 숫자가 포함된 문장 추출
+        sentences = re.split(r'[.!?]\s+', text_content)
+        for sentence in sentences:
+            if re.search(r'\d', sentence) and len(sentence) > 10:
+                # 문장에서 핵심 부분만 추출 (처음 50자)
+                clean_sentence = sentence.strip()[:50]
+                if clean_sentence not in [q[:50] for q in queries]:
+                    queries.append(clean_sentence)
+        
+        return queries[:2]  # 최대 2개 쿼리만
     
-    def _extract_table_text(self, table_data) -> str:
-        """표 데이터를 텍스트로 변환"""
-        texts = []
+    async def _search_external(self, query: str) -> List[SearchResult]:
+        """2단계: 외부 검색 실행"""
         
-        if table_data.headers:
-            texts.append(" ".join(table_data.headers))
+        # 캐시 확인
+        if query in self.search_cache:
+            logger.info(f"검색 캐시 사용: {query}")
+            return self.search_cache[query]
         
-        for row in table_data.rows:
-            texts.append(" ".join(row))
-        
-        return " ".join(texts)
-    
-    def _create_multimodal_fact_issue(
-        self, 
-        doc_meta: DocumentMeta, 
-        page: PageInfo, 
-        element: PageElement,
-        claim: str, 
-        verification: FactVerification
-    ) -> Issue:
-        """멀티모달 요소의 사실 오류 이슈 생성"""
-        
-        if not verification.is_factual:
-            message = f"멀티모달 요소 내 사실 오류: {verification.reasoning}"
-            suggestion = "출처 확인 및 정보 검증 필요"
-        else:  # is_outdated
-            message = f"멀티모달 요소 내 정보 과시: {verification.last_updated}"
-            suggestion = "최신 데이터로 업데이트 권장"
-        
-        issue_id = generate_issue_id(
-            doc_meta.doc_id,
-            page.page_id,
-            element.bbox or BoundingBox(x=0, y=0, width=100, height=100),
-            IssueType.FACT
-        )
-        
-        return Issue(
-            issue_id=issue_id,
-            doc_id=doc_meta.doc_id,
-            page_id=page.page_id,
-            issue_type=IssueType.FACT,
-            bbox_location=element.bbox,
-            element_id=element.element_id,
-            original_text=claim,
-            message=message,
-            suggestion=suggestion,
-            confidence=verification.confidence,
-            confidence_level="high",
-            agent_name="fact_check_agent"
-        )
-    
-    async def _perform_fact_verification(self, claim: str) -> FactVerification:
-        """실제 사실 검증 수행"""
-        try:
-            # 1. 웹 검색
-            search_results = await self._search_for_claim(claim)
-            
-            # 2. LLM 검증
-            verification = await self._verify_with_llm(claim, search_results)
-            
-            # 3. 최신성 검사
-            is_outdated, last_updated = await self._check_if_outdated(claim, search_results)
-            verification.is_outdated = is_outdated
-            verification.last_updated = last_updated
-            
-            return verification
-            
-        except Exception as e:
-            logger.warning(f"사실 검증 실패: {str(e)}")
-            return FactVerification(
-                claim=claim,
-                is_factual=True,  # 검증 실패 시 기본값
-                confidence=0.1,
-                evidence=[],
-                reasoning="검증 과정에서 오류 발생",
-                is_outdated=False
-            )
-    
-    async def _search_for_claim(self, claim: str) -> List[SearchResult]:
-        """주장에 대한 웹 검색 수행"""
         search_results = []
         
         try:
-            if self.serpapi_key:
-                # SerpAPI를 통한 Google 검색
-                results = await self._search_with_serpapi(claim)
-                search_results.extend(results)
+            if self.serpapi_key and self.session:
+                search_results = await self._search_with_serpapi(query)
             else:
-                # 대체 검색 방법 또는 더미 결과
-                logger.warning("SerpAPI 키가 없어 검색을 수행할 수 없습니다")
-                search_results = self._generate_dummy_search_results(claim)
-        
+                # 검색 API가 없는 경우 더미 결과
+                logger.warning("검색 API 키가 없어 더미 결과 사용")
+                search_results = self._generate_dummy_results(query)
+            
+            # 캐시에 저장
+            self.search_cache[query] = search_results
+            
         except Exception as e:
-            logger.warning(f"웹 검색 실패: {str(e)}")
-            search_results = self._generate_dummy_search_results(claim)
+            logger.warning(f"외부 검색 실패 '{query}': {str(e)}")
+            search_results = self._generate_dummy_results(query)
         
-        return search_results[:self.max_search_results]
+        return search_results
     
     async def _search_with_serpapi(self, query: str) -> List[SearchResult]:
         """SerpAPI를 통한 Google 검색"""
-        if not self.session:
-            return []
         
         try:
             url = "https://serpapi.com/search"
@@ -537,38 +364,43 @@ class FactCheckAgent:
                 "q": query,
                 "api_key": self.serpapi_key,
                 "engine": "google",
-                "num": self.max_search_results
+                "num": self.max_search_results,
+                "gl": "kr",  # 한국 결과
+                "hl": "ko"   # 한국어
             }
             
             async with self.session.get(url, params=params) as response:
-                data = await response.json()
+                if response.status != 200:
+                    logger.warning(f"SerpAPI 응답 오류: {response.status}")
+                    return []
                 
+                data = await response.json()
                 results = []
+                
                 for item in data.get("organic_results", []):
                     result = SearchResult(
                         title=item.get("title", ""),
                         url=item.get("link", ""),
                         snippet=item.get("snippet", ""),
-                        source_domain=self._extract_domain(item.get("link", "")),
-                        relevance_score=0.8  # 기본값
+                        source_domain=self._extract_domain(item.get("link", ""))
                     )
                     results.append(result)
                 
+                logger.info(f"SerpAPI 검색 완료: {len(results)}개 결과")
                 return results
-        
+                
         except Exception as e:
             logger.warning(f"SerpAPI 검색 실패: {str(e)}")
             return []
     
-    def _generate_dummy_search_results(self, claim: str) -> List[SearchResult]:
-        """더미 검색 결과 생성 (테스트용)"""
+    def _generate_dummy_results(self, query: str) -> List[SearchResult]:
+        """더미 검색 결과 (테스트/데모용)"""
         return [
             SearchResult(
-                title=f"Fact-checking: {claim[:30]}...",
-                url="https://example.com/fact-check",
-                snippet="이 주장에 대한 검증이 필요합니다.",
-                source_domain="example.com",
-                relevance_score=0.5
+                title=f"Search result for: {query}",
+                url="https://example.com/search",
+                snippet="이 정보는 검증이 필요합니다.",
+                source_domain="example.com"
             )
         ]
     
@@ -576,392 +408,455 @@ class FactCheckAgent:
         """URL에서 도메인 추출"""
         try:
             from urllib.parse import urlparse
-            return urlparse(url).netloc
+            return urlparse(url).netloc.replace("www.", "")
         except:
             return ""
     
-    async def _verify_with_llm(
+    async def _compare_with_search_results(
         self, 
-        claim: str, 
-        search_results: List[SearchResult], 
-        context: str = None
-    ) -> FactVerification:
-        """LLM을 통한 사실 검증"""
-        if not self.llm:
-            return FactVerification(
-                claim=claim,
-                is_factual=True,
-                confidence=0.1,
-                evidence=search_results,
-                reasoning="LLM을 사용할 수 없어 검증하지 못했습니다"
-            )
-        
-        try:
-            # 검색 결과를 문맥으로 정리
-            evidence_text = "\n".join([
-                f"출처 {i+1}: {result.title}\n{result.snippet}\n"
-                for i, result in enumerate(search_results)
-            ])
-            
-            prompt = self._create_fact_verification_prompt(claim, evidence_text, context)
-            
-            response = await self.llm.acomplete(prompt)
-            
-            # LLM 응답 파싱
-            verification = self._parse_llm_verification_response(
-                response.text, claim, search_results
-            )
-            
-            return verification
-            
-        except Exception as e:
-            logger.warning(f"LLM 사실 검증 실패: {str(e)}")
-            return FactVerification(
-                claim=claim,
-                is_factual=True,
-                confidence=0.1,
-                evidence=search_results,
-                reasoning="LLM 검증 중 오류 발생"
-            )
-    
-    def _create_fact_verification_prompt(self, claim: str, evidence: str, context: str = None) -> str:
-        """사실 검증용 프롬프트 생성"""
-        context_part = f"\n\n문맥 정보:\n{context}" if context else ""
-        
-        return f"""다음 주장의 사실 여부를 검증해주세요.
-
-검증할 주장: {claim}
-
-참고 자료:
-{evidence}{context_part}
-
-다음 형식으로 응답해주세요:
-판정: [사실/거짓/불분명]
-신뢰도: [0.0-1.0]
-근거: [판정 이유를 자세히 설명]
-상충정보: [있다면 언급, 없으면 "없음"]
-
-주의사항:
-- 검색 결과와 주장을 신중히 비교 분석하세요
-- 출처의 신뢰성도 고려하세요
-- 불확실한 경우 "불분명"으로 판정하세요
-- 교육 자료의 정확성이 중요하므로 엄격하게 검증하세요"""
-    
-    def _parse_llm_verification_response(
-        self, 
-        response: str, 
-        claim: str, 
+        slide_data: Dict[str, Any], 
+        query: str,
         search_results: List[SearchResult]
     ) -> FactVerification:
-        """LLM 검증 응답 파싱"""
-        try:
-            lines = response.strip().split('\n')
-            
-            # 기본값
-            is_factual = True
-            confidence = 0.5
-            reasoning = "응답 파싱 실패"
-            contradictory_info = None
-            
-            for line in lines:
-                line = line.strip()
-                
-                if line.startswith("판정:"):
-                    judgment = line.split(":", 1)[1].strip().lower()
-                    if "거짓" in judgment or "false" in judgment:
-                        is_factual = False
-                    elif "불분명" in judgment or "unclear" in judgment:
-                        is_factual = False
-                        confidence = 0.3
-                
-                elif line.startswith("신뢰도:"):
-                    try:
-                        confidence = float(line.split(":", 1)[1].strip())
-                    except:
-                        pass
-                
-                elif line.startswith("근거:"):
-                    reasoning = line.split(":", 1)[1].strip()
-                
-                elif line.startswith("상충정보:"):
-                    contradictory_part = line.split(":", 1)[1].strip()
-                    if contradictory_part and contradictory_part != "없음":
-                        contradictory_info = contradictory_part
-            
-            return FactVerification(
-                claim=claim,
-                is_factual=is_factual,
-                confidence=confidence,
-                evidence=search_results,
-                reasoning=reasoning,
-                contradictory_info=contradictory_info
-            )
-            
-        except Exception as e:
-            logger.warning(f"LLM 응답 파싱 실패: {str(e)}")
-            return FactVerification(
-                claim=claim,
-                is_factual=True,
-                confidence=0.1,
-                evidence=search_results,
-                reasoning="응답 파싱 중 오류 발생"
-            )
-    
-    async def _check_if_outdated(
-        self, 
-        claim: str, 
-        search_results: List[SearchResult]
-    ) -> Tuple[bool, Optional[str]]:
-        """정보의 최신성 검사"""
-        if not self.llm:
-            return False, None
+        """3단계: 검색 결과와 슬라이드 내용 대조"""
         
-        try:
-            # 시간 관련 키워드 검사
-            time_keywords = ["최신", "현재", "올해", "작년", "최근", "새로운", "업데이트"]
-            has_time_reference = any(keyword in claim for keyword in time_keywords)
-            
-            if not has_time_reference:
-                return False, None
-            
-            # 검색 결과에서 날짜 정보 수집
-            recent_info = []
-            for result in search_results:
-                if result.published_date:
-                    recent_info.append(f"{result.title}: {result.published_date}")
-            
-            if not recent_info:
-                return False, None
-            
-            # LLM으로 최신성 분석
-            prompt = f"""다음 주장이 현재 시점에서 최신 정보인지 분석해주세요.
+        if not search_results:
+            return FactVerification(
+                claim=query,
+                is_accurate=True,  # 검색 결과 없으면 기본값
+                is_outdated=False,
+                confidence=0.1,
+                reasoning="검색 결과가 없어 검증할 수 없습니다",
+                search_results=[]
+            )
+        
+        # 슬라이드 내용 정리
+        slide_content = ""
+        if slide_data.get("caption"):
+            slide_content += f"캡션: {slide_data['caption']}\n"
+        if slide_data.get("slide_text"):
+            slide_content += f"텍스트: {slide_data['slide_text']}\n"
+        
+        # 검색 결과 요약
+        search_summary = "\n".join([
+            f"출처 {i+1} ({result.source_domain}): {result.title}\n{result.snippet}"
+            for i, result in enumerate(search_results[:3])
+        ])
+        
+        comparison_prompt = f"""다음 슬라이드 내용과 외부 검색 결과를 비교하여 사실 정확성을 판단해주세요.
 
-주장: {claim}
+슬라이드 내용:
+{slide_content}
 
-최근 정보:
-{chr(10).join(recent_info)}
+검색 결과:
+{search_summary}
 
 현재 날짜: {datetime.now().strftime('%Y년 %m월')}
 
-다음 형식으로 응답해주세요:
-최신성: [최신/구식/불분명]
-마지막업데이트: [예상 날짜 또는 "불명"]
-이유: [판단 근거]"""
-            
-            response = await self.llm.acomplete(prompt)
-            
-            # 응답 파싱
-            lines = response.text.strip().split('\n')
-            is_outdated = False
-            last_updated = None
-            
-            for line in lines:
-                if line.startswith("최신성:"):
-                    status = line.split(":", 1)[1].strip().lower()
-                    if "구식" in status or "outdated" in status:
-                        is_outdated = True
-                
-                elif line.startswith("마지막업데이트:"):
-                    last_updated = line.split(":", 1)[1].strip()
-                    if last_updated == "불명":
-                        last_updated = None
-            
-            return is_outdated, last_updated
-            
-        except Exception as e:
-            logger.warning(f"최신성 검사 실패: {str(e)}")
-            return False, None
-    
-    def get_source_credibility_score(self, url: str) -> float:
-        """소스의 신뢰도 점수 계산"""
-        domain = self._extract_domain(url)
-        
-        # 신뢰할 수 있는 소스 체크
-        for category, sources in self.trusted_sources.items():
-            for trusted_source in sources:
-                if trusted_source in domain:
-                    if category == "academic":
-                        return 0.9
-                    elif category == "official":
-                        return 0.85
-                    elif category == "news":
-                        return 0.8
-                    elif category == "technology":
-                        return 0.75
-        
-        # 일반 웹사이트
-        if domain.endswith('.edu') or domain.endswith('.gov'):
-            return 0.85
-        elif domain.endswith('.org'):
-            return 0.7
-        else:
-            return 0.5
+다음 기준으로 판단하세요:
+1. 정확성: 슬라이드의 정보가 검색 결과와 일치하는가?
+2. 최신성: 슬라이드의 정보가 현재 시점에서 최신인가?
 
+JSON 형식으로 응답해주세요:
+{{
+    "is_accurate": true|false,
+    "is_outdated": true|false,
+    "confidence": 0.0-1.0,
+    "reasoning": "판단 근거 (2-3문장)"
+}}"""
 
-# 테스트 함수
-async def test_fact_check_agent():
-    """FactCheckAgent 테스트"""
-    print("🧪 FactCheckAgent 테스트 시작...")
-    
-    import os
-    from dotenv import load_dotenv
-    from pathlib import Path
-    env_path = Path(__file__).resolve().parents[2] / '.env.dev'
-    load_dotenv(env_path)
-    
-    openai_key = os.getenv("OPENAI_API_KEY")
-    serpapi_key = os.getenv("SERPAPI_API_KEY")  # 필요 시 추가
-    
-    # 에이전트 생성
-    agent = FactCheckAgent(
-        openai_api_key=openai_key,
-        serpapi_key=serpapi_key
-    )
-    
-    # 테스트 주장들
-    test_claims = [
-        "GPT-4는 2023년에 출시되었습니다",
-        "한국의 인구는 약 5천만명입니다",
-        "최신 연구에 따르면 딥러닝 모델의 정확도가 95%를 넘었습니다",
-        "ChatGPT는 현재 무료로 사용할 수 있습니다",
-        "작년 AI 시장 규모는 100조원을 넘었습니다"
-    ]
-    
-    print(f"\n🔍 {len(test_claims)}개 주장 검증 중...")
-    
-    for i, claim in enumerate(test_claims, 1):
-        print(f"\n[{i}] 검증 중: {claim}")
-        
         try:
-            result = await agent.verify_single_claim(claim)
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "user", "content": comparison_prompt}
+                ],
+            )
             
-            print(f"    결과: {'✅ 사실' if result.is_factual else '❌ 거짓/의심'}")
-            print(f"    신뢰도: {result.confidence:.2f}")
-            print(f"    근거: {result.explanation[:100]}...")
-            if result.sources:
-                print(f"    출처: {len(result.sources)}개")
-        
+            response_text = response.choices[0].message.content.strip()
+            
+            # JSON 파싱
+            if response_text.startswith("```json"):
+                response_text = response_text.split("```json")[1].split("```")[0].strip()
+            elif response_text.startswith("```"):
+                response_text = response_text.split("```")[1].split("```")[0].strip()
+            
+            result = json.loads(response_text)
+            
+            return FactVerification(
+                claim=query,
+                is_accurate=result.get("is_accurate", True),
+                is_outdated=result.get("is_outdated", False),
+                confidence=result.get("confidence", 0.5),
+                reasoning=result.get("reasoning", "검증 완료"),
+                search_results=search_results
+            )
+            
+        except json.JSONDecodeError as e:
+            logger.warning(f"대조 결과 JSON 파싱 실패: {response_text[:100]}... - {str(e)}")
+            return FactVerification(
+                claim=query,
+                is_accurate=True,
+                is_outdated=False,
+                confidence=0.1,
+                reasoning="결과 파싱 실패",
+                search_results=search_results
+            )
         except Exception as e:
-            print(f"    ❌ 검증 실패: {str(e)}")
+            logger.error(f"검색 결과 대조 실패: {str(e)}")
+            return FactVerification(
+                claim=query,
+                is_accurate=True,
+                is_outdated=False,
+                confidence=0.1,
+                reasoning="대조 과정 오류",
+                search_results=search_results
+            )
     
-    # 멀티모달 문서 테스트 (더미)
-    print(f"\n📄 멀티모달 문서 사실 검증 테스트...")
-    
-    from src.core.models import DocumentMeta, PageInfo, PageElement, ElementType, ImageElement, generate_doc_id
-    
-    # 테스트용 문서 생성
-    doc_meta = DocumentMeta(
-        doc_id=generate_doc_id("fact_test.pdf"),
-        title="사실 검증 테스트 문서",
-        doc_type="pdf",
-        total_pages=1,
-        file_path="fact_test.pdf"
-    )
-    
-    # 사실 검증 대상이 포함된 페이지
-    test_page = PageInfo(
-        page_id="p001",
-        page_number=1,
-        raw_text="최신 연구에 따르면 GPT-4의 성능이 이전 모델보다 40% 향상되었습니다. 2024년 현재 AI 시장은 급성장하고 있습니다.",
-        word_count=25,
-        elements=[]
-    )
-    
-    print("    문서 내 사실 검증 실행 중...")
-    
-    try:
-        issues = await agent.check_document_facts(doc_meta, [test_page])
+    def _create_fact_issue(
+        self, 
+        slide_data: Dict[str, Any], 
+        verification: FactVerification,
+        doc_meta: DocumentMeta
+    ) -> Issue:
+        """4단계: 팩트체킹 이슈 생성"""
         
-        print(f"    발견된 사실 이슈: {len(issues)}개")
+        # 이슈 메시지 구성
+        if not verification.is_accurate:
+            message = f"사실 정확성 의심: {verification.reasoning}"
+            suggestion = "외부 출처를 확인하여 정보를 검증하세요."
+        else:  # is_outdated
+            message = f"정보 최신성 문제: {verification.reasoning}"
+            suggestion = "최신 데이터로 업데이트를 고려하세요."
+        
+        # 텍스트 위치는 더미로 설정 (캡션 기반이므로 정확한 위치 파악 어려움)
+        text_location = TextLocation(start=0, end=len(verification.claim))
+        
+        issue_id = generate_issue_id(
+            doc_meta.doc_id,
+            slide_data["page_id"],
+            text_location,
+            IssueType.FACT
+        )
+        
+        return Issue(
+            issue_id=issue_id,
+            doc_id=doc_meta.doc_id,
+            page_id=slide_data["page_id"],
+            issue_type=IssueType.FACT,
+            text_location=text_location,
+            bbox_location=None,
+            element_id=None,
+            original_text=verification.claim,
+            message=message,
+            suggestion=suggestion,
+            confidence=verification.confidence,
+            confidence_level="medium",
+            agent_name="fact_check_agent"
+        )
+    
+    def get_factcheck_summary(self, issues: List[Issue]) -> Dict[str, Any]:
+        """팩트체킹 결과 요약"""
+        if not issues:
+            return {
+                "total_fact_issues": 0,
+                "accuracy_issues": 0,
+                "outdated_issues": 0,
+                "avg_confidence": 0.0,
+                "recommendations": ["팩트체킹에서 문제가 발견되지 않았습니다."]
+            }
+        
+        # 이슈 분류
+        accuracy_issues = 0
+        outdated_issues = 0
+        total_confidence = 0
         
         for issue in issues:
-            print(f"      - {issue.message[:80]}...")
-            print(f"        신뢰도: {issue.confidence:.2f}")
-            print(f"        제안: {issue.suggestion[:60]}...")
-    
-    except Exception as e:
-        print(f"    ❌ 문서 검증 실패: {str(e)}")
-    
-    print("\n🎉 FactCheckAgent 테스트 완료!")
+            if "정확성" in issue.message:
+                accuracy_issues += 1
+            elif "최신성" in issue.message:
+                outdated_issues += 1
+            
+            total_confidence += issue.confidence
+        
+        avg_confidence = total_confidence / len(issues) if issues else 0
+        
+        # 권장사항
+        recommendations = []
+        if accuracy_issues > 0:
+            recommendations.append(f"사실 정확성 검토가 필요한 항목이 {accuracy_issues}개 있습니다.")
+        if outdated_issues > 0:
+            recommendations.append(f"정보 업데이트가 필요한 항목이 {outdated_issues}개 있습니다.")
+        
+        return {
+            "total_fact_issues": len(issues),
+            "accuracy_issues": accuracy_issues,
+            "outdated_issues": outdated_issues,
+            "avg_confidence": avg_confidence,
+            "recommendations": recommendations or ["팩트체킹 완료"]
+        }
 
 
-async def test_fact_check_integration():
-    """FactCheckAgent와 다른 에이전트 통합 테스트"""
-    print("🧪 FactCheckAgent 통합 테스트 시작...")
+# E2E 테스트 함수
+async def test_fact_check_agent_e2e():
+    """FactCheckAgent E2E 테스트"""
+    print("🧪 FactCheckAgent E2E 테스트 시작...")
     
     import os
     from dotenv import load_dotenv
     from pathlib import Path
+    
     env_path = Path(__file__).resolve().parents[2] / '.env.dev'
     load_dotenv(env_path)
     
-    # 에이전트들 초기화
-    from src.agents.document_agent import MultimodalDocumentAgent
-    from src.agents.quality_agent import MultimodalQualityAgent
-    
     openai_key = os.getenv("OPENAI_API_KEY")
+    serpapi_key = os.getenv("SERPAPI_API_KEY")  # 선택사항
     
-    document_agent = MultimodalDocumentAgent(openai_api_key=openai_key)
-    quality_agent = MultimodalQualityAgent(openai_api_key=openai_key)
-    fact_agent = FactCheckAgent(openai_api_key=openai_key)
-    
-    # 테스트용 더미 문서 생성 (실제 파일이 없는 경우)
-    from src.core.models import (
-        DocumentMeta, PageInfo, PageElement, ElementType, 
-        ImageElement, BoundingBox, generate_doc_id
-    )
-    
-    doc_meta = DocumentMeta(
-        doc_id=generate_doc_id("integrated_test.pdf"),
-        title="통합 테스트 문서",
-        doc_type="pdf", 
-        total_pages=1,
-        file_path="integrated_test.pdf"
-    )
-    
-    # 사실 검증이 필요한 내용을 포함한 페이지
-    image_element = PageElement(
-        element_id="p001_image_001",
-        element_type=ElementType.IMAGE,
-        bbox=BoundingBox(x=100, y=200, width=300, height=200),
-        image_data=ImageElement(
-            element_id="p001_image_001",
-            bbox=BoundingBox(x=100, y=200, width=300, height=200),
-            format="png",
-            size_bytes=12345,
-            dimensions=(300, 200),
-            ocr_text="2023년 연구에 따르면 ChatGPT 사용자는 1억명을 넘었습니다",
-            description="AI 사용자 통계 차트"
-        )
-    )
-    
-    test_page = PageInfo(
-        page_id="p001",
-        page_number=1,
-        raw_text="최신 연구에 따르면 딥러닝 모델의 정확도가 99%에 달합니다. GPT-4는 현재 가장 강력한 언어 모델입니다.",
-        word_count=20,
-        elements=[image_element]
-    )
-    
-    print("\n🔍 통합 분석 실행...")
+    if not openai_key:
+        print("❌ OPENAI_API_KEY 환경변수가 설정되지 않았습니다.")
+        return
     
     try:
-        # 1. 품질 검사
-        print("1. 품질 검사 실행...")
-        quality_issues = await quality_agent.check_document(doc_meta, [test_page])
-        print(f"   품질 이슈: {len(quality_issues)}개")
+        # 1. DocumentAgent로 문서 처리
+        print("📖 DocumentAgent로 문서 처리 중...")
+        from src.agents.document_agent import DocumentAgent
         
-        # 2. 사실 검증
-        print("2. 사실 검증 실행...")
-        fact_issues = await fact_agent.check_document_facts(doc_meta, [test_page])
-        print(f"   사실 이슈: {len(fact_issues)}개")
+        document_agent = DocumentAgent(
+            openai_api_key=openai_key,
+            vision_model="gpt-5-nano"
+        )
+        
+        # 테스트 파일 찾기
+        test_files = ["sample_docs/sample.pdf"]
+        test_file = None
+        
+        for file_name in test_files:
+            if Path(file_name).exists():
+                test_file = file_name
+                break
+        
+        if not test_file:
+            print("❌ 테스트할 PDF 파일이 없습니다.")
+            print("   Mock 데이터로 테스트를 진행합니다.")
+            
+            # Mock DocumentAgent
+            class MockDocumentAgent:
+                def get_document(self, doc_id):
+                    from src.core.models import DocumentMeta
+                    return DocumentMeta(
+                        doc_id=doc_id,
+                        title="팩트체크 테스트 문서",
+                        doc_type="pdf",
+                        total_pages=3,
+                        file_path="test.pdf"
+                    )
+                
+                def get_slide_data(self, doc_id):
+                    return [
+                        {
+                            "doc_id": doc_id,
+                            "page_id": "p001",
+                            "page_number": 1,
+                            "caption": "GPT-4는 2023년에 OpenAI에서 출시한 대규모 언어 모델입니다. 사용자 수는 1억명을 넘었습니다.",
+                            "slide_text": "GPT-4 소개\n- 출시: 2023년\n- 개발사: OpenAI",
+                            "dimensions": (1920, 1080),
+                            "size_bytes": 123456
+                        },
+                        {
+                            "doc_id": doc_id,
+                            "page_id": "p002",
+                            "page_number": 2,
+                            "caption": "머신러닝에서 경사하강법은 θ = θ - η∇J(θ) 공식으로 표현됩니다.",
+                            "slide_text": "경사하강법\n- 수식: θ = θ - η∇J(θ)\n- η: 학습률",
+                            "dimensions": (1920, 1080),
+                            "size_bytes": 98765
+                        },
+                        {
+                            "doc_id": doc_id,
+                            "page_id": "p003",
+                            "page_number": 3,
+                            "caption": "2024년 한국의 AI 시장 규모는 5조원에 달할 것으로 예상됩니다. 정부 정책에 따라 변동 가능합니다.",
+                            "slide_text": "AI 시장 전망\n- 2024년 예상: 5조원\n- 정부 정책 영향",
+                            "dimensions": (1920, 1080),
+                            "size_bytes": 87654
+                        }
+                    ]
+            
+            document_agent = MockDocumentAgent()
+            doc_meta = document_agent.get_document("mock_doc_001")
+            
+        else:
+            # 실제 파일 처리
+            print(f"   파일: {test_file}")
+            doc_meta = await document_agent.process_document(test_file)
+        
+        print(f"✅ 문서 처리 완료: {doc_meta.doc_id}")
+        
+        # 2. FactCheckAgent로 팩트체킹
+        print("\n🔍 FactCheckAgent로 팩트체킹 중...")
+        
+        fact_agent = FactCheckAgent(
+            openai_api_key=openai_key,
+            serpapi_key=serpapi_key,
+            model="gpt-5-nano"
+        )
+        
+        issues = await fact_agent.analyze_document(document_agent, doc_meta.doc_id)
+        
+        print(f"✅ 팩트체킹 완료!")
+        print(f"   발견된 이슈: {len(issues)}개")
+        
+        # 3. 결과 분석
+        if issues:
+            print(f"\n📋 팩트체킹 이슈들:")
+            
+            for i, issue in enumerate(issues, 1):
+                print(f"\n{i}. [{issue.issue_type.value.upper()}] {issue.page_id}")
+                print(f"   원본: {issue.original_text[:60]}...")
+                print(f"   문제: {issue.message}")
+                print(f"   제안: {issue.suggestion}")
+                print(f"   신뢰도: {issue.confidence:.2f}")
+        else:
+            print("\n✅ 팩트체킹 이슈가 발견되지 않았습니다!")
+        
+        # 4. 요약 정보
+        summary = fact_agent.get_factcheck_summary(issues)
+        print(f"\n📊 팩트체킹 요약:")
+        print(f"   총 이슈: {summary['total_fact_issues']}개")
+        print(f"   정확성 문제: {summary['accuracy_issues']}개")
+        print(f"   최신성 문제: {summary['outdated_issues']}개")
+        print(f"   평균 신뢰도: {summary['avg_confidence']:.2f}")
+        
+        print(f"\n🎯 권장사항:")
+        for rec in summary['recommendations']:
+            print(f"   - {rec}")
+        
+        # 5. 캐시 정보
+        print(f"\n💾 캐시 상태:")
+        print(f"   검색 캐시: {len(fact_agent.search_cache)}개")
+        print(f"   검증 캐시: {len(fact_agent.verification_cache)}개")
+        
+    except ImportError as e:
+        print(f"❌ 모듈 임포트 실패: {str(e)}")
+        print("   DocumentAgent 클래스의 임포트 경로를 확인해주세요.")
+        
+    except Exception as e:
+        print(f"❌ E2E 테스트 실패: {str(e)}")
+        import traceback
+        traceback.print_exc()
+    
+    print("\n🎉 FactCheckAgent E2E 테스트 완료!")
+
+
+# 통합 테스트 함수
+async def test_full_pipeline():
+    """전체 파이프라인 통합 테스트 (DocumentAgent + QualityAgent + FactCheckAgent)"""
+    print("🧪 전체 파이프라인 통합 테스트 시작...")
+    
+    import os
+    from dotenv import load_dotenv
+    from pathlib import Path
+    
+    env_path = Path(__file__).resolve().parents[2] / '.env.dev'
+    load_dotenv(env_path)
+    
+    openai_key = os.getenv("OPENAI_API_KEY")
+    serpapi_key = os.getenv("SERPAPI_API_KEY")
+    
+    if not openai_key:
+        print("❌ OPENAI_API_KEY 환경변수가 설정되지 않았습니다.")
+        return
+    
+    try:
+        # 테스트용 Mock DocumentAgent (간단한 데이터)
+        class MockDocumentAgent:
+            def get_document(self, doc_id):
+                from src.core.models import DocumentMeta
+                return DocumentMeta(
+                    doc_id=doc_id,
+                    title="EDU-Audit 통합 테스트",
+                    doc_type="pdf",
+                    total_pages=2,
+                    file_path="integration_test.pdf"
+                )
+            
+            def get_slide_data(self, doc_id):
+                return [
+                    {
+                        "doc_id": doc_id,
+                        "page_id": "p001",
+                        "page_number": 1,
+                        "caption": "ChatGPT는 2022년에 출시되었고 현재 사용자 수가 1억명을 넘었습니다. 이는 최신 통계입니다.",
+                        "slide_text": "ChatGPT 현황\n- 출시: 2022년\n- 사용자: 1억명+",
+                        "image_base64": "dummy_base64_data",
+                        "dimensions": (1920, 1080),
+                        "size_bytes": 123456
+                    },
+                    {
+                        "doc_id": doc_id,
+                        "page_id": "p002", 
+                        "page_number": 2,
+                        "caption": "머신러닝에서 경사하강법은 θ = θ - α∇J(θ) 공식으로 표현됩니다. 여기서 α는 학습률입니다.",
+                        "slide_text": "경사하강법 공식\nθ = θ - α∇J(θ)",
+                        "image_base64": "dummy_base64_data",
+                        "dimensions": (1920, 1080),
+                        "size_bytes": 98765
+                    }
+                ]
+        
+        document_agent = MockDocumentAgent()
+        doc_id = "integration_test_001"
+        
+        print("📖 Mock 문서 데이터 준비 완료")
+        
+        # 1. QualityAgent 실행
+        print("\n🔍 QualityAgent 실행 중...")
+        try:
+            from src.agents.quality_agent import QualityAgent, QualityConfig
+            
+            quality_config = QualityConfig(
+                max_issues_per_slide=2,
+                confidence_threshold=0.7,
+                issue_severity_filter="medium"
+            )
+            
+            quality_agent = QualityAgent(
+                openai_api_key=openai_key,
+                vision_model="gpt-5-nano",
+                config=quality_config
+            )
+            
+            quality_issues = await quality_agent.analyze_document(document_agent, doc_id)
+            print(f"   품질 이슈: {len(quality_issues)}개")
+            
+        except ImportError:
+            print("   ⚠️ QualityAgent 임포트 실패 - 건너뜀")
+            quality_issues = []
+        except Exception as e:
+            print(f"   ❌ QualityAgent 실행 실패: {str(e)}")
+            quality_issues = []
+        
+        # 2. FactCheckAgent 실행  
+        print("\n🔍 FactCheckAgent 실행 중...")
+        
+        fact_agent = FactCheckAgent(
+            openai_api_key=openai_key,
+            serpapi_key=serpapi_key,
+            model="gpt-5-nano"
+        )
+        
+        fact_issues = await fact_agent.analyze_document(document_agent, doc_id)
+        print(f"   팩트체킹 이슈: {len(fact_issues)}개")
         
         # 3. 통합 결과 분석
         all_issues = quality_issues + fact_issues
         
-        print(f"\n📊 통합 결과:")
+        print(f"\n📊 통합 분석 결과:")
         print(f"   총 이슈: {len(all_issues)}개")
+        print(f"   품질 이슈: {len(quality_issues)}개")
+        print(f"   팩트체킹 이슈: {len(fact_issues)}개")
         
+        # 이슈 타입별 분류
         issue_by_type = {}
         for issue in all_issues:
             issue_type = issue.issue_type.value
@@ -969,35 +864,120 @@ async def test_fact_check_integration():
                 issue_by_type[issue_type] = []
             issue_by_type[issue_type].append(issue)
         
+        print(f"\n📈 이슈 타입별 분포:")
         for issue_type, issues in issue_by_type.items():
             print(f"   {issue_type}: {len(issues)}개")
-            for issue in issues[:2]:  # 처음 2개만 출력
-                print(f"     - {issue.message[:60]}...")
+            
+            # 각 타입에서 대표 이슈 1개씩 출력
+            if issues:
+                sample_issue = issues[0]
+                print(f"     예시: {sample_issue.message[:50]}...")
         
-        # 4. 멀티모달 + 사실검증 특화 분석
-        multimodal_fact_issues = [
-            issue for issue in fact_issues 
-            if issue.element_id is not None
-        ]
+        # 4. 에이전트별 요약
+        if quality_issues:
+            quality_summary = quality_agent.get_quality_summary(quality_issues)
+            print(f"\n🎯 품질 요약:")
+            print(f"   품질 점수: {quality_summary['quality_score']:.2f}/1.0")
+            for rec in quality_summary['recommendations'][:2]:
+                print(f"   - {rec}")
         
-        print(f"\n🖼️ 멀티모달 사실 검증:")
-        print(f"   멀티모달 요소의 사실 이슈: {len(multimodal_fact_issues)}개")
+        if fact_issues:
+            fact_summary = fact_agent.get_factcheck_summary(fact_issues)
+            print(f"\n🎯 팩트체킹 요약:")
+            print(f"   평균 신뢰도: {fact_summary['avg_confidence']:.2f}")
+            for rec in fact_summary['recommendations'][:2]:
+                print(f"   - {rec}")
         
-        for issue in multimodal_fact_issues:
-            print(f"     요소 {issue.element_id}: {issue.message[:50]}...")
-    
+        # 5. 최종 권장사항
+        print(f"\n✅ 최종 권장사항:")
+        if len(all_issues) == 0:
+            print("   문서 품질과 팩트체킹 모두 양호합니다.")
+        elif len(quality_issues) > len(fact_issues):
+            print("   품질 개선에 우선 집중하시기 바랍니다.")
+        else:
+            print("   사실 확인 및 정보 업데이트가 우선 필요합니다.")
+        
     except Exception as e:
         print(f"❌ 통합 테스트 실패: {str(e)}")
         import traceback
         traceback.print_exc()
     
-    print("\n🎉 통합 테스트 완료!")
+    print("\n🎉 전체 파이프라인 통합 테스트 완료!")
+
+
+# 단위 테스트 함수
+async def test_fact_check_agent():
+    """FactCheckAgent 단위 테스트"""
+    print("🧪 FactCheckAgent 단위 테스트 시작...")
+    
+    import os
+    from dotenv import load_dotenv
+    from pathlib import Path
+    
+    env_path = Path(__file__).resolve().parents[2] / '.env.dev'
+    load_dotenv(env_path)
+    
+    openai_key = os.getenv("OPENAI_API_KEY")
+    if not openai_key:
+        print("❌ OPENAI_API_KEY가 필요합니다.")
+        return
+    
+    # 에이전트 생성
+    agent = FactCheckAgent(
+        openai_api_key=openai_key,
+        serpapi_key=None,  # 단위 테스트에서는 검색 비활성화
+        model="gpt-5-nano"
+    )
+    
+    # 테스트 슬라이드 데이터
+    test_slides = [
+        {
+            "page_id": "p001",
+            "page_number": 1,
+            "caption": "GPT-4는 2023년 3월에 OpenAI가 출시한 대규모 언어 모델입니다.",
+            "slide_text": "GPT-4 출시일: 2023년 3월"
+        },
+        {
+            "page_id": "p002", 
+            "page_number": 2,
+            "caption": "딥러닝에서 역전파는 ∂L/∂w = δx 공식으로 계산됩니다.",
+            "slide_text": "역전파 공식: ∂L/∂w = δx"
+        },
+        {
+            "page_id": "p003",
+            "page_number": 3, 
+            "caption": "2024년 한국 AI 투자 규모는 10조원을 돌파했습니다.",
+            "slide_text": "AI 투자: 10조원 돌파"
+        }
+    ]
+    
+    print(f"📋 {len(test_slides)}개 슬라이드 트리거 테스트...")
+    
+    # 1. 트리거 테스트
+    async with agent:
+        for slide in test_slides:
+            trigger = await agent._check_factcheck_trigger(slide)
+            
+            print(f"\n슬라이드 {slide['page_id']}:")
+            print(f"   팩트체크 필요: {'✅' if trigger.factcheck_required else '❌'}")
+            print(f"   이유: {trigger.reason}")
+            print(f"   키워드: {trigger.keywords}")
+            print(f"   신뢰도: {trigger.confidence:.2f}")
+    
+    print("\n🎉 단위 테스트 완료!")
 
 
 if __name__ == "__main__":
     import sys
     
-    if len(sys.argv) > 1 and sys.argv[1] == "integration":
-        asyncio.run(test_fact_check_integration())
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "e2e":
+            asyncio.run(test_fact_check_agent_e2e())
+        elif sys.argv[1] == "pipeline":
+            asyncio.run(test_full_pipeline()) 
+        elif sys.argv[1] == "unit":
+            asyncio.run(test_fact_check_agent())
+        else:
+            print("사용법: python fact_check_agent.py [e2e|pipeline|unit]")
     else:
         asyncio.run(test_fact_check_agent())
