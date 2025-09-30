@@ -217,7 +217,7 @@ def initialize_agent():
         tools=tools,
         verbose=True,
         handle_parsing_errors=True,
-        max_iterations=5,
+        max_iterations=10,
         return_intermediate_steps=False
     )
     
@@ -360,44 +360,31 @@ st.markdown('<div class="sub-header">교육 자료 품질 검수 AI 어시스턴
 st.markdown("### 🚀 빠른 명령")
 col1, col2, col3, col4 = st.columns(4)
 
+# 버튼 클릭 시 실행할 명령 저장
+quick_command = None
+
 with col1:
     if st.button("📋 문서 목록", use_container_width=True):
-        st.session_state.messages.append({
-            "role": "user",
-            "content": "업로드된 문서 목록을 보여줘"
-        })
-        st.rerun()
+        quick_command = "업로드된 문서 목록을 보여줘"
 
 with col2:
     if st.button("✅ 품질 검사", use_container_width=True):
         if st.session_state.current_doc_id:
-            st.session_state.messages.append({
-                "role": "user",
-                "content": f"{st.session_state.current_doc_id} 문서의 품질을 분석해줘"
-            })
-            st.rerun()
+            quick_command = f"{st.session_state.current_doc_id} 문서의 품질을 분석해줘"
         else:
             st.warning("먼저 문서를 선택하세요")
 
 with col3:
     if st.button("🔍 팩트체크", use_container_width=True):
         if st.session_state.current_doc_id:
-            st.session_state.messages.append({
-                "role": "user",
-                "content": f"{st.session_state.current_doc_id} 문서를 팩트체크해줘"
-            })
-            st.rerun()
+            quick_command = f"{st.session_state.current_doc_id} 문서를 팩트체크해줘"
         else:
             st.warning("먼저 문서를 선택하세요")
 
 with col4:
     if st.button("📊 전체 분석", use_container_width=True):
         if st.session_state.current_doc_id:
-            st.session_state.messages.append({
-                "role": "user",
-                "content": f"{st.session_state.current_doc_id} 문서를 전체 분석해줘"
-            })
-            st.rerun()
+            quick_command = f"{st.session_state.current_doc_id} 문서를 전체 분석해줘"
         else:
             st.warning("먼저 문서를 선택하세요")
 
@@ -407,6 +394,53 @@ st.markdown("---")
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
+
+# 빠른 명령 처리 (버튼 클릭 시)
+if quick_command:
+    # 사용자 메시지 추가
+    st.session_state.messages.append({"role": "user", "content": quick_command})
+    
+    with st.chat_message("user"):
+        st.markdown(quick_command)
+    
+    # Agent 응답
+    with st.chat_message("assistant"):
+        with st.spinner("생각하는 중..."):
+            try:
+                agent_executor = initialize_agent()
+                
+                if agent_executor is None:
+                    response = "❌ Agent를 초기화할 수 없습니다. tools 모듈을 확인하세요."
+                else:
+                    # chat_history 준비
+                    chat_history = []
+                    for msg in st.session_state.messages[:-1]:
+                        if msg["role"] == "user":
+                            chat_history.append(HumanMessage(content=msg["content"]))
+                        else:
+                            chat_history.append(AIMessage(content=msg["content"]))
+                    
+                    # Agent 실행
+                    result = agent_executor.invoke({
+                        "input": quick_command,
+                        "chat_history": chat_history
+                    })
+                    
+                    response = result.get("output", "응답을 생성할 수 없습니다.")
+                
+                st.markdown(response)
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": response
+                })
+                
+            except Exception as e:
+                error_msg = f"❌ 오류 발생: {str(e)}"
+                st.error(error_msg)
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": error_msg
+                })
 
 # 채팅 입력
 if prompt := st.chat_input("메시지를 입력하세요... (예: '문서 목록 보여줘', '품질 검사해줘')"):
