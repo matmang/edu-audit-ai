@@ -1,4 +1,4 @@
-# app/agents/quality_wrapper.py
+# app/wrappers/quality_wrapper.py
 """
 QualityAgent Wrapper - 품질 검수 에이전트 래퍼
 """
@@ -6,7 +6,7 @@ QualityAgent Wrapper - 품질 검수 에이전트 래퍼
 import logging
 from typing import Any, Dict, List, Optional
 
-from src.app.agents.base import BaseAgentWrapper, validate_doc_id
+from src.app.wrappers.base import BaseAgentWrapper, validate_doc_id
 from src.agents.quality_agent import QualityAgent
 from src.agents.document_agent import DocumentAgent
 from src.core.models import generate_report_id
@@ -71,11 +71,11 @@ class QualityAgentWrapper(BaseAgentWrapper):
             cached_result = self._analysis_cache[doc_id]
             logger.info(f"캐시된 품질 분석 결과 사용: {doc_id}")
 
-            cached_issues = cached_result["issue"]
+            cached_issues = cached_result["issues"]
             issues_data = []
             for issue in cached_issues:
                 if hasattr(issue, 'model_dump'):
-                    issue_dict = issue.model_dump(made='json')
+                    issue_dict = issue.model_dump(mode='json')
                 else:
                     issue_dict = issue
                 issues_data.append(issue_dict)

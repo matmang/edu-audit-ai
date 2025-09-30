@@ -52,24 +52,6 @@ class AppState:
         
         logger.info("AppState 초기화 완료")
 
-    @property
-    def executor(self):
-        """지연 로딩된 Executor 인스턴스"""
-        if self._executor is None:
-            from src.app.executor import Executor
-            self._executor = Executor(self.registry)
-            logger.info("Executor 지연 로딩 완료")
-        return self._executor
-
-    @property
-    def aggregator(self):
-        """지연 로딩된 Aggregator 인스턴스"""
-        if self._aggregator is None:
-            from src.app.aggregator import Aggregator
-            self._aggregator = Aggregator()
-            logger.info("Aggregator 지연 로딩 완료")
-        return self._aggregator
-
     def increment_stat(self, stat_name: str, value: int = 1) -> None:
         """
         통계 카운터 증가

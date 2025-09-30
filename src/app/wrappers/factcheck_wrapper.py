@@ -1,4 +1,4 @@
-# app/agents/factcheck_wrapper.py
+# app/wrappers/factcheck_wrapper.py
 """
 FactCheckAgent Wrapper - 팩트체킹 에이전트 래퍼
 """
@@ -7,7 +7,7 @@ import logging
 from typing import Any, Dict, List, Optional
 from datetime import datetime
 
-from src.app.agents.base import BaseAgentWrapper, validate_doc_id
+from src.app.wrappers.base import BaseAgentWrapper, validate_doc_id
 from src.agents.factcheck_agent import FactCheckAgent
 from src.agents.document_agent import DocumentAgent
 from src.core.models import generate_report_id

@@ -213,6 +213,7 @@ class BaseAgentWrapper(ABC):
             return await self._execute_with_stats(action, request)
             
         except Exception as e:
+            print(e)
             logger.error(f"에이전트 {self.name} 요청 처리 실패: {str(e)}")
             return {
                 "agent": self.name,

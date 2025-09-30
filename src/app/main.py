@@ -28,9 +28,9 @@ load_dotenv()
 
 # 앱 상태 및 컴포넌트들
 from src.app.state import app_state, initialize_app, shutdown_app, get_app_state
-from src.app.agents.document_wrapper import DocumentAgentWrapper
-from src.app.agents.quality_wrapper import QualityAgentWrapper
-from src.app.agents.factcheck_wrapper import FactCheckAgentWrapper
+from src.app.wrappers.document_wrapper import DocumentAgentWrapper
+from src.app.wrappers.quality_wrapper import QualityAgentWrapper
+from src.app.wrappers.factcheck_wrapper import FactCheckAgentWrapper
 
 # 실제 에이전트 임포트
 try:
@@ -290,8 +290,8 @@ async def analyze_quality(doc_id: str, state: Any = Depends(get_app_state)):
             
     except KeyError:
         raise HTTPException(status_code=503, detail="QualityAgent가 등록되지 않았습니다.")
-    except HTTPException:
-        raise
+    except HTTPException as e:
+        raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
         state.increment_stat("failed_requests")
         logger.error(f"품질 분석 실패: {str(e)}")

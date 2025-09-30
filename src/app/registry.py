@@ -5,7 +5,7 @@ Agent Registry - 에이전트 등록 및 관리
 
 import logging
 from typing import Dict, List, Optional
-from src.app.agents.base import BaseAgentWrapper
+from src.app.wrappers.base import BaseAgentWrapper
 
 logger = logging.getLogger(__name__)
 

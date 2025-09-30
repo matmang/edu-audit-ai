@@ -1,4 +1,4 @@
-# app/agents/document_wrapper.py
+# app/wrappers/document_wrapper.py
 """
 DocumentAgent Wrapper - 문서 처리 에이전트 래퍼
 """
@@ -7,7 +7,7 @@ import logging
 from typing import Any, Dict, List, Optional
 from pathlib import Path
 
-from src.app.agents.base import BaseAgentWrapper, validate_doc_id
+from src.app.wrappers.base import BaseAgentWrapper, validate_doc_id
 from src.agents.document_agent import DocumentAgent
 from src.core.models import DocumentMeta
 
